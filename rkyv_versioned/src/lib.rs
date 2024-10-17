@@ -39,10 +39,11 @@ pub trait VersionedContainer: Archive {
     fn is_valid_version_id(version: u32) -> bool;
     fn get_entry_version_id(&self) -> u32;
 
-    fn get_ref_from_tagged_versioned_bytes(
+    fn get_type_and_version_from_tagged_bytes(
         buf: &[u8],
-    ) -> Result<&Self::Archived, rkyv::rancor::Error>;
-    fn to_tagged_versioned_bytes(item: &Self) -> Result<AlignedVec, rkyv::rancor::Error>
+    ) -> Result<(u32, u32), rkyv::rancor::Error>;
+    fn get_ref_from_tagged_bytes(buf: &[u8]) -> Result<&Self::Archived, rkyv::rancor::Error>;
+    fn to_tagged_bytes(item: &Self) -> Result<AlignedVec, rkyv::rancor::Error>
     where
         Self: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rkyv::rancor::Error>>;
 }
@@ -82,10 +83,19 @@ mod tests {
             b: 2,
             c: "YEET".to_owned(),
         };
+        let v1_container = TestContainer::V1(&v1);
+
         let tswv_container_bytes: AlignedVec =
-            TestContainer::to_tagged_versioned_bytes(&TestContainer::V1(&v1)).unwrap();
-        let twsv_ref =
-            TestContainer::get_ref_from_tagged_versioned_bytes(&tswv_container_bytes).unwrap();
+            TestContainer::to_tagged_bytes(&v1_container).unwrap();
+        assert_eq!(
+            TestContainer::get_type_and_version_from_tagged_bytes(&tswv_container_bytes).unwrap(),
+            (
+                TestContainer::ARCHIVE_TYPE_ID,
+                v1_container.get_entry_version_id()
+            )
+        );
+
+        let twsv_ref = TestContainer::get_ref_from_tagged_bytes(&tswv_container_bytes).unwrap();
 
         match twsv_ref {
             ArchivedTestContainer::V1(v1_ref) => {
@@ -102,10 +112,17 @@ mod tests {
             c: 300,
             d: "SKEET".to_owned(),
         };
+        let v2_container = TestContainer::V2(&v2);
         let tswv_container_bytes: AlignedVec =
-            TestContainer::to_tagged_versioned_bytes(&TestContainer::V2(&v2)).unwrap();
-        let twsv_ref =
-            TestContainer::get_ref_from_tagged_versioned_bytes(&tswv_container_bytes).unwrap();
+            TestContainer::to_tagged_bytes(&v2_container).unwrap();
+        assert_eq!(
+            TestContainer::get_type_and_version_from_tagged_bytes(&tswv_container_bytes).unwrap(),
+            (
+                TestContainer::ARCHIVE_TYPE_ID,
+                v2_container.get_entry_version_id()
+            )
+        );
+        let twsv_ref = TestContainer::get_ref_from_tagged_bytes(&tswv_container_bytes).unwrap();
 
         match twsv_ref {
             ArchivedTestContainer::V2(v2_ref) => {
@@ -127,8 +144,7 @@ mod tests {
         invalid_type_bytes[2] = 0x01;
         invalid_type_bytes[3] = 0x01;
 
-        let invalid_type_result =
-            TestContainer::get_ref_from_tagged_versioned_bytes(&invalid_type_bytes);
+        let invalid_type_result = TestContainer::get_ref_from_tagged_bytes(&invalid_type_bytes);
         assert!(invalid_type_result.is_err());
         assert_eq!(
             invalid_type_result.err().unwrap().to_string(),
@@ -142,8 +158,7 @@ mod tests {
         let mut invalid_ver_bytes = tswv_container_bytes.clone();
         invalid_ver_bytes[4] = 9;
 
-        let invalid_ver_result =
-            TestContainer::get_ref_from_tagged_versioned_bytes(&invalid_ver_bytes);
+        let invalid_ver_result = TestContainer::get_ref_from_tagged_bytes(&invalid_ver_bytes);
         assert!(invalid_ver_result.is_err());
         assert_eq!(
             invalid_ver_result.err().unwrap().to_string(),

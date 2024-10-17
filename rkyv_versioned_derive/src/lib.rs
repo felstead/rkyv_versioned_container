@@ -57,11 +57,6 @@ fn generate(enum_name: Ident, data_enum: DataEnum, generics: Generics) -> TokenS
         }
     }
 
-    // Build the valid version comparison - there is probably a more concise way to do this
-    let valid_version_comparison = quote! {
-        #(#valid_versions)|*
-    };
-
     // We only care about the number of lifetimes since we'll just use anonymous ones
     let lifetime_params = generics
         .lifetimes()
@@ -88,31 +83,37 @@ fn generate(enum_name: Ident, data_enum: DataEnum, generics: Generics) -> TokenS
 
             fn is_valid_version_id(version : u32) -> bool {
                 match version {
-                    #valid_version_comparison => true,
+                    #(#valid_versions)|* => true,
                     _ => false,
                 }
             }
 
-            fn get_ref_from_tagged_versioned_bytes(buf : & [u8]) -> Result<&Self::Archived, rkyv::rancor::Error> {
-                const HEADER_SIZE : usize = core::mem::size_of::<ArchivedTaggedVersionedContainerHeaderOnly>();
+            fn get_type_and_version_from_tagged_bytes(buf: &[u8]) -> Result<(u32, u32), rkyv::rancor::Error> {
+                const HEADER_SIZE: usize =
+                    core::mem::size_of::<ArchivedTaggedVersionedContainerHeaderOnly>();
 
-                let header = rkyv::access::<ArchivedTaggedVersionedContainerHeaderOnly, rkyv::rancor::Error>(&buf[0..HEADER_SIZE])?;
+                let header: &ArchivedTaggedVersionedContainerHeaderOnly = rkyv::access::<ArchivedTaggedVersionedContainerHeaderOnly, rkyv::rancor::Error>(&buf[0..HEADER_SIZE])?;
+                Ok((header.0.into(), header.1.into()))
+            }
+
+            fn get_ref_from_tagged_bytes(buf : & [u8]) -> Result<&Self::Archived, rkyv::rancor::Error> {
+                let (type_id, version_id) = Self::get_type_and_version_from_tagged_bytes(buf)?;
 
                 // Ensure the type header is correct
-                if header.0 != Self::ARCHIVE_TYPE_ID {
-                    rkyv::rancor::fail!(UnexpectedTypeError(Self::ARCHIVE_TYPE_ID, header.0.into()));
+                if type_id != Self::ARCHIVE_TYPE_ID {
+                    rkyv::rancor::fail!(UnexpectedTypeError(Self::ARCHIVE_TYPE_ID, type_id));
                 }
 
                 // Ensure the version header is valid
-                if Self::is_valid_version_id(header.1.into()) {
+                if Self::is_valid_version_id(version_id) {
                     let archived = rkyv::access::<ArchivedTaggedVersionedContainer<Self>, rkyv::rancor::Error>(&buf)?;
                     Ok(&archived.2)
                 } else {
-                    rkyv::rancor::fail!(UnsupportedVersionError(header.1.into()))
+                    rkyv::rancor::fail!(UnsupportedVersionError(version_id))
                 }
             }
 
-            fn to_tagged_versioned_bytes(item : &Self) -> Result<AlignedVec, rkyv::rancor::Error>
+            fn to_tagged_bytes(item : &Self) -> Result<AlignedVec, rkyv::rancor::Error>
                 where Self: for<'b> Serialize<HighSerializer<AlignedVec, ArenaHandle<'b>, rkyv::rancor::Error>>
             {
                 let container = TaggedVersionedContainer (Self::ARCHIVE_TYPE_ID, item.get_entry_version_id(), item);

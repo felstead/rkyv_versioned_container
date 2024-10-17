@@ -101,11 +101,13 @@ pub trait VersionedContainer: Archive {
     fn is_valid_version_id(version: u32) -> bool;
     fn get_entry_version_id(&self) -> u32;
 
-    fn get_type_and_version_from_tagged_bytes(buf: &[u8]) -> Result<(u32, u32), rancor::Error>;
-    fn get_ref_from_tagged_bytes(buf: &[u8]) -> Result<&Self::Archived, rancor::Error>;
-    fn to_tagged_bytes(item: &Self) -> Result<AlignedVec, rancor::Error>
+    fn get_type_and_version_from_tagged_bytes(
+        buf: &[u8],
+    ) -> Result<(u32, u32), rkyv::rancor::Error>;
+    fn get_ref_from_tagged_bytes(buf: &[u8]) -> Result<&Self::Archived, rkyv::rancor::Error>;
+    fn to_tagged_bytes(item: &Self) -> Result<AlignedVec, rkyv::rancor::Error>
     where
-        Self: for<'b> Serialize<HighSerializer<AlignedVec, ArenaHandle<'b>, rancor::Error>>;
+        Self: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rkyv::rancor::Error>>;
 }
 ```
 
