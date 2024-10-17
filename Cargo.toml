@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = [
+    "rkyv_versioned",
+    "rkyv_versioned_derive",
+]

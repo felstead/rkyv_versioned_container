@@ -1,0 +1,9 @@
+[package]
+name = "rkyv_versioned"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+const-crc32 = "1.3.0"
+rkyv = "0.8.8"
+rkyv_versioned_derive = { path = "../rkyv_versioned_derive" }
