@@ -113,8 +113,8 @@ fn generate(enum_name: Ident, data_enum: DataEnum, generics: Generics) -> TokenS
                 }
             }
 
-            fn to_tagged_bytes(item : &Self) -> Result<AlignedVec, rkyv::rancor::Error>
-                where Self: for<'b> Serialize<HighSerializer<AlignedVec, ArenaHandle<'b>, rkyv::rancor::Error>>
+            fn to_tagged_bytes(item : &Self) -> Result<rkyv::util::AlignedVec, rkyv::rancor::Error>
+                where Self: for<'b> rkyv::Serialize<rkyv::api::high::HighSerializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::rancor::Error>>
             {
                 let container = TaggedVersionedContainer (Self::ARCHIVE_TYPE_ID, item.get_entry_version_id(), item);
                 rkyv::to_bytes(&container)

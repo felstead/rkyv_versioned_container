@@ -7,9 +7,10 @@ use rkyv::{Archive, Serialize};
 
 // Re-export the derive macro
 pub use rkyv_versioned_derive::VersionedArchiveContainer;
+pub use const_crc32;
 
 #[derive(Debug)]
-pub struct UnexpectedTypeError(u32, u32);
+pub struct UnexpectedTypeError(pub u32, pub u32);
 impl Error for UnexpectedTypeError {}
 impl fmt::Display for UnexpectedTypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -18,7 +19,7 @@ impl fmt::Display for UnexpectedTypeError {
 }
 
 #[derive(Debug)]
-pub struct UnsupportedVersionError(u32);
+pub struct UnsupportedVersionError(pub u32);
 impl Error for UnsupportedVersionError {}
 impl fmt::Display for UnsupportedVersionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -29,10 +30,10 @@ impl fmt::Display for UnsupportedVersionError {
 // This is only referenced in the macro and it's not picked up here.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Archive, Serialize)]
-struct TaggedVersionedContainer<'a, T: Archive>(u32, u32, #[rkyv(with = Inline)] &'a T);
+pub struct TaggedVersionedContainer<'a, T: Archive>(pub u32, pub u32, #[rkyv(with = Inline)] pub &'a T);
 
 #[derive(Debug, Clone, Archive, Serialize)]
-struct TaggedVersionedContainerHeaderOnly(u32, u32);
+pub struct TaggedVersionedContainerHeaderOnly(pub u32, pub u32);
 
 pub trait VersionedContainer: Archive {
     const ARCHIVE_TYPE_ID: u32;
