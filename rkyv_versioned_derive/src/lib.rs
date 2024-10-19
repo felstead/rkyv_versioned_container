@@ -2,6 +2,9 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Data, DataEnum, DeriveInput, Fields, Generics, Ident};
 
+/// Derive macro for automatically implementing VersionedArchiveContainer for an enum.
+///
+/// See the `VersionedContainer` trait and the example in the `rkyv_versioned` crate for more details.
 #[proc_macro_derive(VersionedArchiveContainer)]
 pub fn derive_versioned_archive_container(
     input: proc_macro::TokenStream,
@@ -96,28 +99,14 @@ fn generate(enum_name: Ident, data_enum: DataEnum, generics: Generics) -> TokenS
                 Ok((header.0.into(), header.1.into()))
             }
 
-            fn get_ref_from_tagged_bytes(buf : & [u8]) -> Result<&Self::Archived, rkyv::rancor::Error> {
-                let (type_id, version_id) = Self::get_type_and_version_from_tagged_bytes(buf)?;
-
-                // Ensure the type header is correct
-                if type_id != Self::ARCHIVE_TYPE_ID {
-                    rkyv::rancor::fail!(UnexpectedTypeError(Self::ARCHIVE_TYPE_ID, type_id));
-                }
-
-                // Ensure the version header is valid
-                if Self::is_valid_version_id(version_id) {
-                    let archived = rkyv::access::<ArchivedTaggedVersionedContainer<Self>, rkyv::rancor::Error>(&buf)?;
-                    Ok(&archived.2)
-                } else {
-                    rkyv::rancor::fail!(UnsupportedVersionError(version_id))
-                }
+            fn access_from_tagged_bytes(buf : & [u8]) -> Result<&Self::Archived, rkyv::rancor::Error> {
+                access_from_tagged_bytes::<Self>(buf)
             }
 
             fn to_tagged_bytes(item : &Self) -> Result<rkyv::util::AlignedVec, rkyv::rancor::Error>
                 where Self: for<'b> rkyv::Serialize<rkyv::api::high::HighSerializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::rancor::Error>>
             {
-                let container = TaggedVersionedContainer (Self::ARCHIVE_TYPE_ID, item.get_entry_version_id(), item);
-                rkyv::to_bytes(&container)
+                to_tagged_bytes(item)
             }
         }
     }

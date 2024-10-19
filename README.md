@@ -48,7 +48,7 @@ struct TestStructV2 {
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
-enum TestContainer<'a> {
+enum TestVersionedContainer<'a> {
     V1(#[rkyv(with=Inline)] &'a TestStructV1),
     V2(#[rkyv(with=Inline)] &'a TestStructV2),
 }
@@ -80,7 +80,7 @@ fn main() {
 
     // You can now more confidently access the data using zero-copy rkyv primitives
     let twsv_ref: &ArchivedTestVersionedContainer<'_> =
-        TestVersionedContainer::get_ref_from_tagged_bytes(&tswv_container_bytes).unwrap();
+        TestVersionedContainer::access_from_tagged_bytes(&tswv_container_bytes).unwrap();
     match twsv_ref {
         ArchivedTestVersionedContainer::V1(v1_ref) => {
             assert_eq!(v1_ref.a, 1);
@@ -104,7 +104,7 @@ pub trait VersionedContainer: Archive {
     fn get_type_and_version_from_tagged_bytes(
         buf: &[u8],
     ) -> Result<(u32, u32), rkyv::rancor::Error>;
-    fn get_ref_from_tagged_bytes(buf: &[u8]) -> Result<&Self::Archived, rkyv::rancor::Error>;
+    fn access_from_tagged_bytes(buf: &[u8]) -> Result<&Self::Archived, rkyv::rancor::Error>;
     fn to_tagged_bytes(item: &Self) -> Result<AlignedVec, rkyv::rancor::Error>
     where
         Self: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rkyv::rancor::Error>>;
