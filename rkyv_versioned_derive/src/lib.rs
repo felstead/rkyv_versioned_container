@@ -4,7 +4,8 @@ use syn::{Data, DataEnum, DeriveInput, Fields, Generics, Ident};
 
 /// Derive macro for automatically implementing VersionedArchiveContainer for an enum.
 ///
-/// See the `VersionedContainer` trait and the example in the `rkyv_versioned` crate for more details.
+/// See the `VersionedContainer` trait and the example in the `rkyv_versioned` crate for more
+/// details.
 #[proc_macro_derive(VersionedArchiveContainer)]
 pub fn derive_versioned_archive_container(
     input: proc_macro::TokenStream,
@@ -89,24 +90,6 @@ fn generate(enum_name: Ident, data_enum: DataEnum, generics: Generics) -> TokenS
                     #(#valid_versions)|* => true,
                     _ => false,
                 }
-            }
-
-            fn get_type_and_version_from_tagged_bytes(buf: &[u8]) -> Result<(u32, u32), rkyv::rancor::Error> {
-                const HEADER_SIZE: usize =
-                    core::mem::size_of::<ArchivedTaggedVersionedContainerHeaderOnly>();
-
-                let header: &ArchivedTaggedVersionedContainerHeaderOnly = rkyv::access::<ArchivedTaggedVersionedContainerHeaderOnly, rkyv::rancor::Error>(&buf[0..HEADER_SIZE])?;
-                Ok((header.0.into(), header.1.into()))
-            }
-
-            fn access_from_tagged_bytes(buf : & [u8]) -> Result<&Self::Archived, rkyv::rancor::Error> {
-                access_from_tagged_bytes::<Self>(buf)
-            }
-
-            fn to_tagged_bytes(item : &Self) -> Result<rkyv::util::AlignedVec, rkyv::rancor::Error>
-                where Self: for<'b> rkyv::Serialize<rkyv::api::high::HighSerializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::rancor::Error>>
-            {
-                to_tagged_bytes(item)
             }
         }
     }

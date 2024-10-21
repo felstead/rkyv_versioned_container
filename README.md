@@ -66,7 +66,7 @@ fn main() {
 
     // This byte stream contains extra metadata allowing you to identify the type and version before
     // attempting to access it
-    let tswv_container_bytes: AlignedVec = TestVersionedContainer::to_tagged_bytes(&container).unwrap();
+    let tswv_container_bytes: AlignedVec = to_tagged_bytes(&container).unwrap();
 
     // Imagine now that you're reading this byte stream from a file or network - it is _probably_ a
     // TestContainer::V1, but you can't be sure, it _could_ be a TestContainer::V2 (which would
@@ -74,21 +74,24 @@ fn main() {
     // maybe it's not even a TestContainer at all. With the tagged container, we can validate
     // beforehand, or have logic to handle different structures or versions.
     let (type_id, version_id) =
-        TestVersionedContainer::get_type_and_version_from_tagged_bytes(&tswv_container_bytes).unwrap();
+        get_type_and_version_from_tagged_bytes(&tswv_container_bytes).unwrap();
     assert_eq!(type_id, TestVersionedContainer::ARCHIVE_TYPE_ID);
     assert_eq!(version_id, container.get_entry_version_id());
 
-    // You can now more confidently access the data using zero-copy rkyv primitives
-    let twsv_ref: &ArchivedTestVersionedContainer<'_> =
-        TestVersionedContainer::access_from_tagged_bytes(&tswv_container_bytes).unwrap();
-    match twsv_ref {
-        ArchivedTestVersionedContainer::V1(v1_ref) => {
-            assert_eq!(v1_ref.a, 1);
-            assert_eq!(v1_ref.b, 2);
-            assert_eq!(v1_ref.c, "YEET");
-        }
-        _ => panic!("Expected V1"),
-    }
+    // You can now more confidently access the data using zero-copy rkyv primitives.  Alternatively,
+    // you can implicitly use the `RkyvVersionedError` type to handle errors programmatically.
+    match access_from_tagged_bytes::<TestVersionedContainer>(&tswv_container_bytes) {
+       Ok(ArchivedTestVersionedContainer::V1(v1_ref)) => {
+           assert_eq!(v1_ref.a, 1);
+           assert_eq!(v1_ref.b, 2);
+           assert_eq!(v1_ref.c, "YEET");
+       },
+       Ok(_) => panic!("Expected V1"),
+       Err(RkyvVersionedError::BufferTooSmallError) => panic!("Buffer too small!"),
+       Err(RkyvVersionedError::UnexpectedTypeError(expected, found)) => panic!("Expected type {} but got {}", expected, found),
+       Err(RkyvVersionedError::UnsupportedVersionError(version)) => panic!("Found unsupported version {}", version),
+       Err(RkyvVersionedError::RkyvError(rkyv_error)) => panic!("Rkyv error: {}", rkyv_error)
+   };
 }
 ```
 
