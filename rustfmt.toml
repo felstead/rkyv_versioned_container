@@ -1,4 +1,4 @@
-max_width = 100
-comment_width = 100
+max_width = 95
+comment_width = 95
 wrap_comments = true
 condense_wildcard_suffixes = true
