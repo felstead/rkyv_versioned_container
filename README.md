@@ -49,8 +49,8 @@ struct TestStructV2 {
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
 enum TestVersionedContainer<'a> {
-    V1(#[rkyv(with=Inline)] &'a TestStructV1),
-    V2(#[rkyv(with=Inline)] &'a TestStructV2),
+    V1(#[rkyv(with=InlineAsBox)] &'a TestStructV1),
+    V2(#[rkyv(with=InlineAsBox)] &'a TestStructV2),
 }
 
 fn main() {
@@ -116,7 +116,17 @@ pub trait VersionedContainer: Archive {
 
 This generated code will include a (mostly) unique `u32` ID for the type in `ARCHIVE_TYPE_ID` (based on the crc32 of the container type name, e.g. `crc32(TestVersionedContainer)`) and it will generate incrementing IDs for each variant of its containing struct, e.g. `V1` has a version ID of `0`, `V2` has a version ID of `1` and so on.
 
-When the data is serialized using `to_tagged_bytes` it is serialized as a tuple of `(archive_type_id, version_id, Self::Archived)`.  The layout of `rkyv` tuples allow us to "peek" at the `archive_type_id` and `version_id` at the head of the byte stream without doing any further checking/deserialization of the enum type - this allows for guarding against unknown/unsupported data.
+When the data is serialized using `to_tagged_bytes` it is serialized as a `TaggedVersionedStruct`, which looks like this:
+```rust
+#[derive(Debug, Clone, Archive, Serialize)]
+pub struct TaggedVersionedStruct<'a, T: Archive> {
+    pub type_id: u32,
+    pub version_id: u32,
+    #[rkyv(with = InlineAsBox)]
+    pub inner: &'a T,
+}
+```
+If we access this with `T` set as the unit type (i.e. `()`) this will allow us to deserialize the `type_id` and `version_id` fields without trying to actually deserialize the `inner` field, which is serialized as a `Box<()>` which is effectively ignored.
 
 
 ## Documentation

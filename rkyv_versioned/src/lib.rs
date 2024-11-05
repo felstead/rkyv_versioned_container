@@ -30,7 +30,7 @@
 //! ```rust
 //! use rkyv::{Archive, Serialize, Deserialize};
 //! use rkyv::util::AlignedVec;
-//! use rkyv::with::Inline;
+//! use rkyv::with::InlineAsBox;
 //! use rkyv_versioned::*;
 //!
 //! #[derive(Debug, Archive, Serialize, Deserialize)]
@@ -50,8 +50,8 @@
 //!
 //! #[derive(Debug, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
 //! enum TestVersionedContainer<'a> {
-//!     V1(#[rkyv(with=Inline)] &'a TestStructV1),
-//!     V2(#[rkyv(with=Inline)] &'a TestStructV2),
+//!     V1(#[rkyv(with=InlineAsBox)] &'a TestStructV1),
+//!     V2(#[rkyv(with=InlineAsBox)] &'a TestStructV2),
 //! }
 //!
 //! fn main() {
@@ -59,7 +59,7 @@
 //!     let v1 = TestStructV1 {
 //!         a: 1,
 //!         b: 2,
-//!         c: "YEET".to_owned(),
+//!         c: "YEEEEEEEEEEET".to_owned(),
 //!     };
 //!
 //!     // Create our versioned container to store our v1 data
@@ -87,7 +87,7 @@
 //!         Ok(ArchivedTestVersionedContainer::V1(v1_ref)) => {
 //!             assert_eq!(v1_ref.a, 1);
 //!             assert_eq!(v1_ref.b, 2);
-//!             assert_eq!(v1_ref.c, "YEET");
+//!             assert_eq!(v1_ref.c, "YEEEEEEEEEEET");
 //!         }
 //!         Ok(_) => panic!("Expected V1"),
 //!         Err(RkyvVersionedError::BufferTooSmallError) => panic!("Buffer too small!"),
@@ -123,15 +123,14 @@
 //! # Internal Container Structures
 //! These structures are used internally to handle versioned data and are generally not used
 //! directly.
-//! - [TaggedVersionedContainer]: A container that includes type and version IDs along with the
+//! - [TaggedVersionedStruct]: A container that includes type and version IDs along with the
 //!   data.
-//! - [TaggedVersionedContainerHeaderOnly]: A container that includes only type and version
-//!   IDs.
+
 use core::{error::Error, fmt};
 use rkyv::api::high::HighSerializer;
 use rkyv::ser::allocator::ArenaHandle;
 use rkyv::util::AlignedVec;
-use rkyv::with::Inline;
+use rkyv::with::InlineAsBox;
 use rkyv::{Archive, Serialize};
 
 // Re-export the derive macro
@@ -165,35 +164,16 @@ impl fmt::Display for RkyvVersionedError {
 
 /// A container that holds a versioned item along with its type and version IDs.
 ///
-/// This is the structure that is the result of serializing a versioned container. We use a
-/// tuple struct to allow us to "peek" at the header without deserializing the entire item,
-/// exploiting the fact that `rkyv` tuples are laid out in a predictable order.
-///
-/// This generally shouldn't need to be used directly, but is exposed for convenience.
+/// This is the structure that is the result of serializing a versioned container. We
+/// deserialize this with the `T` type set as `()` to allow us to "peek" at the header fields
+/// without deserializing the entire item.
 #[derive(Debug, Clone, Archive, Serialize)]
-pub struct TaggedVersionedContainer<'a, T: Archive>(
-    /// The type ID of the item.
-    pub u32,
-    /// The version ID of the item
-    pub u32,
-    /// A reference to the item
-    #[rkyv(with = Inline)]
-    pub &'a T,
-);
-
-/// A container that holds only the type and version IDs of a versioned item.
-///
-/// This exists mostly just as a convenience to access the first two elements of a
-/// [TaggedVersionedContainer] without deserializing the entire item.
-///
-/// This generally shouldn't need to be used directly, but is exposed for convenience.
-#[derive(Debug, Clone, Archive, Serialize)]
-pub struct TaggedVersionedContainerHeaderOnly(
-    /// * `0` - The type ID of the item.
-    pub u32,
-    /// * `1` - The version ID of the item.
-    pub u32,
-);
+pub struct TaggedVersionedStruct<'a, T: Archive> {
+    pub type_id: u32,
+    pub version_id: u32,
+    #[rkyv(with = InlineAsBox)]
+    pub inner: &'a T,
+}
 
 /// Serializes a versioned container into a tagged byte array to be deserialized from
 /// [access_from_tagged_bytes].  This is analogous to `rkyv::to_bytes`, but only for
@@ -212,8 +192,11 @@ pub fn to_tagged_bytes<T: VersionedContainer>(
 where
     T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rkyv::rancor::Error>>,
 {
-    let container =
-        TaggedVersionedContainer(T::ARCHIVE_TYPE_ID, item.get_entry_version_id(), item);
+    let container = TaggedVersionedStruct {
+        type_id: T::ARCHIVE_TYPE_ID,
+        version_id: item.get_entry_version_id(),
+        inner: item,
+    };
     rkyv::to_bytes(&container).map_err(|e| RkyvVersionedError::RkyvError(e))
 }
 
@@ -237,8 +220,11 @@ where
     T: for<'a> Serialize<HighSerializer<W, ArenaHandle<'a>, rkyv::rancor::Error>>,
     W: rkyv::ser::Writer<rkyv::rancor::Error>,
 {
-    let container =
-        TaggedVersionedContainer(T::ARCHIVE_TYPE_ID, item.get_entry_version_id(), item);
+    let container = TaggedVersionedStruct {
+        type_id: T::ARCHIVE_TYPE_ID,
+        version_id: item.get_entry_version_id(),
+        inner: item,
+    };
     rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&container, writer)
         .map_err(|e| RkyvVersionedError::RkyvError(e))
 }
@@ -260,19 +246,16 @@ where
 pub fn get_type_and_version_from_tagged_bytes(
     buf: &[u8],
 ) -> Result<(u32, u32), RkyvVersionedError> {
-    const HEADER_SIZE: usize =
-        core::mem::size_of::<ArchivedTaggedVersionedContainerHeaderOnly>();
+    const MIN_SIZE: usize = core::mem::size_of::<ArchivedTaggedVersionedStruct<()>>();
 
-    if buf.len() < HEADER_SIZE {
+    if buf.len() < MIN_SIZE {
         return Err(RkyvVersionedError::BufferTooSmallError);
     }
 
-    let header: &ArchivedTaggedVersionedContainerHeaderOnly = rkyv::access::<
-        ArchivedTaggedVersionedContainerHeaderOnly,
-        rkyv::rancor::Error,
-    >(&buf[0..HEADER_SIZE])
-    .map_err(|e| RkyvVersionedError::RkyvError(e))?;
-    Ok((header.0.into(), header.1.into()))
+    let header = rkyv::access::<ArchivedTaggedVersionedStruct<()>, rkyv::rancor::Error>(&buf)
+        .map_err(|e| RkyvVersionedError::RkyvError(e))?;
+
+    Ok((header.type_id.into(), header.version_id.into()))
 }
 
 /// Deserializes a versioned container from a tagged byte array generated by [to_tagged_bytes].
@@ -307,9 +290,9 @@ where
     // Ensure the version header is valid
     if T::is_valid_version_id(version_id) {
         let archived =
-            rkyv::access::<ArchivedTaggedVersionedContainer<T>, rkyv::rancor::Error>(&buf)
+            rkyv::access::<ArchivedTaggedVersionedStruct<T>, rkyv::rancor::Error>(&buf)
                 .map_err(|e| RkyvVersionedError::RkyvError(e))?;
-        Ok(&archived.2)
+        Ok(&archived.inner)
     } else {
         Err(RkyvVersionedError::UnsupportedVersionError(version_id))
     }
@@ -364,16 +347,18 @@ mod tests {
     #[derive(Debug, PartialEq, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
     #[rkyv(compare(PartialEq))]
     enum TestContainer<'a> {
-        V1(#[rkyv(with=Inline)] &'a TestStructV1),
-        V2(#[rkyv(with=Inline)] &'a TestStructV2),
+        V1(#[rkyv(with=InlineAsBox)] &'a TestStructV1),
+        V2(#[rkyv(with=InlineAsBox)] &'a TestStructV2),
     }
 
     #[test]
     fn test_versioned_container() {
+        // Longer strings will be serialized out-of-line in the data, so it is important to
+        // test that scenario
         let v1 = TestStructV1 {
             a: 1,
             b: 2,
-            c: "YEET".to_owned(),
+            c: "YEEEEEEEEEEEEEEEEEEEET".to_owned(),
         };
         let v1_container = TestContainer::V1(&v1);
 
@@ -395,7 +380,7 @@ mod tests {
             ArchivedTestContainer::V1(v1_ref) => {
                 assert_eq!(v1_ref.a, 1);
                 assert_eq!(v1_ref.b, 2);
-                assert_eq!(v1_ref.c, "YEET");
+                assert_eq!(v1_ref.c, "YEEEEEEEEEEEEEEEEEEEET");
             }
             _ => panic!("Expected V1"),
         }
@@ -428,15 +413,17 @@ mod tests {
             _ => panic!("Expected V2"),
         }
 
-        // Generate invalid type id
         const EXPECTED_TYPE_ID: u32 = const_crc32::crc32("TestContainer".as_bytes());
         const MUNGED_TYPE_ID: u32 = 0x01010101;
 
-        let mut invalid_type_bytes = tswv_container_bytes.clone();
-        invalid_type_bytes[0] = 0x01;
-        invalid_type_bytes[1] = 0x01;
-        invalid_type_bytes[2] = 0x01;
-        invalid_type_bytes[3] = 0x01;
+        // Generate invalid type id
+        let invalid_type_struct = TaggedVersionedStruct::<TestContainer> {
+            type_id: MUNGED_TYPE_ID,
+            version_id: 0,
+            inner: &v1_container,
+        };
+        let invalid_type_bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&invalid_type_struct).unwrap();
 
         match access_from_tagged_bytes::<TestContainer>(&invalid_type_bytes) {
             Err(RkyvVersionedError::UnexpectedTypeError(expected, got)) => {
@@ -447,7 +434,21 @@ mod tests {
         };
 
         // Generate invalid version id
-        let mut invalid_ver_bytes = tswv_container_bytes.clone();
-        invalid_ver_bytes[4] = 9;
+        const MUNGED_VERSION_ID: u32 = 0x01010101;
+        let invalid_version_struct = TaggedVersionedStruct::<TestContainer> {
+            type_id: EXPECTED_TYPE_ID,
+            version_id: MUNGED_VERSION_ID,
+            inner: &v1_container,
+        };
+
+        let invalid_version_bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&invalid_version_struct).unwrap();
+
+        match access_from_tagged_bytes::<TestContainer>(&invalid_version_bytes) {
+            Err(RkyvVersionedError::UnsupportedVersionError(version)) => {
+                assert_eq!(version, MUNGED_VERSION_ID);
+            }
+            _ => panic!("Expected RkyvVersionedError::UnsupportedVersionError"),
+        };
     }
 }
