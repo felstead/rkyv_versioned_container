@@ -28,6 +28,7 @@ fn generate(enum_name: Ident, data_enum: DataEnum, generics: Generics) -> TokenS
 
     // Parse the enum variants
     let mut valid_versions: Vec<TokenStream> = vec![];
+    let mut newest_version_id: u32 = 0;
     let mut match_branches = quote! {};
     for (variant_index, variant) in data_enum.variants.iter().enumerate() {
         // Cache this for error messages
@@ -44,6 +45,7 @@ fn generate(enum_name: Ident, data_enum: DataEnum, generics: Generics) -> TokenS
                 // TODO: Allow overriding of this with #[rkyv_util_version(X)]
                 let variant_index_as_u32 = variant_index as u32;
                 valid_versions.push(quote! { #variant_index_as_u32 });
+                newest_version_id = newest_version_id.max(variant_index_as_u32);
 
                 let branch_name = &variant.ident;
                 match_branches.extend(quote! {
@@ -75,8 +77,11 @@ fn generate(enum_name: Ident, data_enum: DataEnum, generics: Generics) -> TokenS
 
         #[automatically_derived]
         // Automatically derived implementation of VersionedContainer for #enum_name
-        impl VersionedContainer for #enum_name #lifetime_decl {
-            const ARCHIVE_TYPE_ID : u32 = const_crc32::crc32(#string_name.as_bytes());
+        impl ::rkyv_versioned::VersionedContainer for #enum_name #lifetime_decl {
+            const ARCHIVE_TYPE_ID : u32 =
+                ::rkyv_versioned::const_crc32::crc32(#string_name.as_bytes());
+            const ARCHIVE_TYPE_NAME : &'static str = #string_name;
+            const NEWEST_VERSION_ID : u32 = #newest_version_id;
 
             fn get_entry_version_id(&self) -> u32 {
                 match self {
