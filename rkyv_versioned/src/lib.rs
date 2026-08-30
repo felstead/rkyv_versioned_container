@@ -105,6 +105,31 @@
 //! }
 //! ```
 //!
+//! # Container attributes
+//! The derive accepts one namespaced attribute, following rkyv's own attribute style:
+//!
+//! ```rust
+//! # use rkyv::{Archive, Serialize, Deserialize};
+//! # use rkyv_versioned::*;
+//! # #[derive(Debug, Archive, Serialize, Deserialize)]
+//! # struct EntryV1 { pub a: u32 }
+//! #[derive(Debug, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
+//! #[rkyv_versioned(archive_type_name = "fxv::BranchLedgerEntry")]
+//! enum BranchLedgerEntryContainer {
+//!     V1(EntryV1),
+//! }
+//! # assert_eq!(
+//! #     BranchLedgerEntryContainer::ARCHIVE_TYPE_NAME,
+//! #     "fxv::BranchLedgerEntry"
+//! # );
+//! ```
+//!
+//! `archive_type_name` pins the string that [VersionedContainer::ARCHIVE_TYPE_ID] is hashed
+//! from and that error messages report, instead of the container's identifier. Use it when two
+//! containers readable from the same store would otherwise share a name, or to keep the ID
+//! stable across a future rename of the type. Setting or changing it changes the stored type
+//! ID, so pick it before writing data, not after.
+//!
 //! # Buffer contract
 //! A tagged byte array must be handed back to the accessors exactly as it came out of
 //! [to_tagged_bytes] or [to_tagged_bytes_in]. rkyv locates the archived root from the *end* of
@@ -119,16 +144,97 @@
 //! Buffer alignment follows rkyv's usual rules for the archived type, and is checked by the
 //! checked accessors. `AlignedVec` satisfies it; a `Vec<u8>` filled from a file may not.
 //!
-//! # Upgrading to the latest version
-//! Matching every variant of a container at every read site does not scale: adding a `V3`
-//! means revisiting all of them, and nothing makes you do it. Implementing [VersionedUpgrade]
-//! puts the whole conversion in one place, so reading code deals with a single type.
+//! # Reading across versions
+//! Destructuring the container at each read site, `let Container::V1(v1) = &container`, ties
+//! every one of those sites to a version. Adding a `V3` then means editing all of them, which
+//! is a hassle.
+//!
+//! Put the version knowledge in accessors on the archived container instead, and have reading
+//! code call those. Each accessor answers for every version, so no call site refers to a
+//! specific one:
+//!
+//! ```rust
+//! use rkyv::{Archive, Serialize, Deserialize};
+//! use rkyv_versioned::*;
+//!
+//! #[derive(Debug, Archive, Serialize, Deserialize)]
+//! struct EntryV1 {
+//!     pub revision: u32,
+//!     pub name: String,
+//! }
+//!
+//! #[derive(Debug, Archive, Serialize, Deserialize)]
+//! struct EntryV2 {
+//!     pub revision: u64,
+//!     pub name: String,
+//!     pub retired: bool,
+//! }
+//!
+//! #[derive(Debug, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
+//! enum EntryContainer {
+//!     V1(EntryV1),
+//!     V2(EntryV2),
+//! }
+//!
+//! impl ArchivedEntryContainer {
+//!     // V1 stored this narrower, so it widens here rather than at every call site
+//!     pub fn revision(&self) -> u64 {
+//!         match self {
+//!             ArchivedEntryContainer::V1(v1) => v1.revision.to_native() as u64,
+//!             ArchivedEntryContainer::V2(v2) => v2.revision.to_native(),
+//!         }
+//!     }
+//!
+//!     pub fn name(&self) -> &str {
+//!         match self {
+//!             ArchivedEntryContainer::V1(v1) => &v1.name,
+//!             ArchivedEntryContainer::V2(v2) => &v2.name,
+//!         }
+//!     }
+//!
+//!     // Added in V2. Older data answers with the documented default, so callers that do not
+//!     // care about the new field are unaffected.
+//!     pub fn retired(&self) -> bool {
+//!         match self {
+//!             ArchivedEntryContainer::V1(_) => false,
+//!             ArchivedEntryContainer::V2(v2) => v2.retired,
+//!         }
+//!     }
+//! }
+//!
+//! fn main() {
+//!     let bytes = to_tagged_bytes(&EntryContainer::V1(EntryV1 {
+//!         revision: 7,
+//!         name: "main".to_owned(),
+//!     }))
+//!     .unwrap();
+//!
+//!     // The same three calls would read V2 bytes, with no conversion and no allocation
+//!     let entry = access_from_tagged_bytes::<EntryContainer>(&bytes).unwrap();
+//!     assert_eq!(entry.revision(), 7);
+//!     assert_eq!(entry.name(), "main");
+//!     assert!(!entry.retired());
+//! }
+//! ```
+//!
+//! Reads stay zero-copy for every version, since an accessor returns data out of the mapped
+//! bytes and nothing is converted. Adding a `V3` makes each accessor's match non-exhaustive,
+//! so the compiler lists the accessors to extend and leaves call sites alone. Do not write a
+//! wildcard arm, which would silently answer for versions nobody has considered.
+//!
+//! An accessor can only hide a difference it can express in one return type. A field whose
+//! type genuinely differs between versions, such as a nested struct that changed, needs its
+//! own accessors on the nested type, or an accessor per leaf value.
+//!
+//! # Producing an owned latest version
+//! Reading is served by the accessors above. [VersionedUpgrade] covers the other case: code
+//! that needs an owned value of the newest type, which is what a pass that rewrites stored
+//! data into the latest version does.
 //!
 //! The trait is implemented by hand on the archived container type, as one match over every
 //! version. The last variant returns [MaybeUpgraded::Current] and every earlier variant
 //! converts to the latest type. Adding a version to the container makes that match
-//! non-exhaustive, so the compiler points at it until the new version is handled. Do not add a
-//! wildcard arm, which would silently accept versions nobody has thought about. An arm that
+//! non-exhaustive, so the compiler points at it until the new version is handled. An arm that
 //! deliberately refuses to convert older data, for instance when a format break makes it
 //! unreadable, returns [RkyvVersionedError::UpgradeNotSupported].
 //!
@@ -183,7 +289,7 @@
 //!     }))
 //!     .unwrap();
 //!
-//!     // Whichever version was stored, the reader only ever sees TestStructV2
+//!     // Whichever version was stored, this yields the newest type
 //!     match upgrade_from_tagged_bytes::<TestVersionedContainer>(&old_bytes).unwrap() {
 //!         MaybeUpgraded::Upgraded(v2) => assert_eq!(v2.a, 7),
 //!         MaybeUpgraded::Current(_) => panic!("V1 needs converting"),
@@ -228,7 +334,9 @@
 //! - [VersionedContainer]: A trait that is automatically implemented on a versioned container
 //!   using the `#[derive(VersionedArchiveContainer)]` attribute.
 //! - [VersionedUpgrade]: A hand-written trait on the archived container type, converting any
-//!   version of a container to its latest one as a [MaybeUpgraded].
+//!   version of a container to its latest one as a [MaybeUpgraded]. For reading stored data,
+//!   prefer accessors on the archived container (see "Reading across versions"); this is for
+//!   code that needs an owned value of the newest type.
 //!
 //! # Error Types
 //! Given that introspection of the deserialization errors are more useful in this context
@@ -534,13 +642,16 @@ pub trait VersionedContainer: Archive {
     /// A constant representing the type ID of the archived data. When generated by
     /// the derive macro, this is a CRC32 hash of the type name.
     ///
-    /// The name is the bare identifier, without its module path, so two containers of the same
-    /// name in different modules produce the same ID. CRC32 collisions are possible in
-    /// general. Where several containers can be read from one store, assert their IDs are
-    /// distinct.
+    /// The name defaults to the bare identifier, without its module path, so two containers of
+    /// the same name in different modules produce the same ID, and CRC32 collisions are
+    /// possible in general. Where several containers can be read from one store, assert their
+    /// IDs are distinct, and pin a unique name with
+    /// `#[rkyv_versioned(archive_type_name = "...")]` where they are not.
     ///
-    /// This ID is written into every serialized record, so how it is derived cannot change
-    /// without invalidating data already stored.
+    /// This ID is written into every serialized record, so neither how it is derived nor the
+    /// name it is derived from can change without invalidating data already stored. Module
+    /// paths deliberately do not contribute to it: moving or renaming a module would otherwise
+    /// silently change the ID of every record already written.
     const ARCHIVE_TYPE_ID: u32;
 
     /// The name of the container type, used to make error messages diagnosable. When generated
@@ -591,8 +702,13 @@ where
     }
 }
 
-/// Converts any version of a container to its latest version, so that reading code deals with
-/// one type instead of matching every variant by hand.
+/// Converts any version of a container to its latest version, for code that needs an owned
+/// value of the newest type.
+///
+/// Reading stored data does not need this. Accessors on the archived container answer for
+/// every version with no conversion at all, so no call site refers to a specific version; see
+/// "Reading across versions" in the crate documentation. This trait covers the other case,
+/// such as a pass that rewrites stored records into the latest version.
 ///
 /// This is implemented by hand on the *archived* container type, as a single match over every
 /// version. The last variant returns [MaybeUpgraded::Current], which stays zero-copy, and
@@ -679,6 +795,14 @@ mod tests {
     enum TestContainerOwned {
         V1(TestStructV1),
         V2(TestStructV2),
+    }
+
+    /// A container that pins the string its type ID is hashed from, so that moving or renaming
+    /// the type cannot change the ID.
+    #[derive(Debug, PartialEq, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
+    #[rkyv_versioned(archive_type_name = "rkyv_versioned::TestContainerRenamed")]
+    enum TestContainerNamed {
+        V1(TestStructV1),
     }
 
     /// A container that has only ever had one version, so every upgrade is a no-op.
@@ -920,7 +1044,7 @@ mod tests {
     }
 
     /// The header peek accesses the buffer as `TaggedVersionedStruct<()>`, so that type must
-    /// have the same layout as one holding a real payload, whatever the payload contains.
+    /// have the same layout as one holding an actual payload, whatever the payload contains.
     #[test]
     fn test_header_layout_is_payload_independent() {
         assert_eq!(
@@ -954,6 +1078,38 @@ mod tests {
 
         assert!(get_type_and_version_from_tagged_bytes(&padded).is_err());
         assert!(access_from_tagged_bytes::<TestContainerOwned>(&padded).is_err());
+    }
+
+    /// The override decides both the reported name and the hashed type ID, and it is the ID
+    /// stored in the data, so a container that pins it survives being moved or renamed.
+    #[test]
+    fn test_archive_type_name_override() {
+        const PINNED: &str = "rkyv_versioned::TestContainerRenamed";
+
+        assert_eq!(TestContainerNamed::ARCHIVE_TYPE_NAME, PINNED);
+        assert_eq!(
+            TestContainerNamed::ARCHIVE_TYPE_ID,
+            const_crc32::crc32(PINNED.as_bytes())
+        );
+        assert_ne!(
+            TestContainerNamed::ARCHIVE_TYPE_ID,
+            const_crc32::crc32("TestContainerNamed".as_bytes())
+        );
+
+        // The pinned ID is what round-trips, and it reaches error messages
+        let bytes = to_tagged_bytes(&TestContainerNamed::V1(make_v1())).unwrap();
+        assert_eq!(
+            get_type_and_version_from_tagged_bytes(&bytes).unwrap().0,
+            TestContainerNamed::ARCHIVE_TYPE_ID
+        );
+        assert!(access_from_tagged_bytes::<TestContainerNamed>(&bytes).is_ok());
+
+        match access_from_tagged_bytes::<TestContainerOwned>(&bytes) {
+            Err(RkyvVersionedError::UnexpectedTypeError { found_type_id, .. }) => {
+                assert_eq!(found_type_id, TestContainerNamed::ARCHIVE_TYPE_ID);
+            }
+            _ => panic!("Expected RkyvVersionedError::UnexpectedTypeError"),
+        }
     }
 
     #[test]
