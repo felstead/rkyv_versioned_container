@@ -54,7 +54,7 @@
 //!     V1(#[rkyv(with=InlineAsBox)] &'a TestStructV1),
 //!     V2(#[rkyv(with=InlineAsBox)] &'a TestStructV2),
 //! }
-//! 
+//!
 //! fn main() {
 //!     // Serialize a v1 into a versioned container byte stream
 //!     let v1 = TestStructV1 {
@@ -92,26 +92,251 @@
 //!         }
 //!         Ok(_) => panic!("Expected V1"),
 //!         Err(RkyvVersionedError::BufferTooSmallError) => panic!("Buffer too small!"),
-//!         Err(RkyvVersionedError::UnexpectedTypeError(expected, found)) => {
-//!             panic!("Expected type {} but got {}", expected, found)
+//!         Err(RkyvVersionedError::UnexpectedTypeError { expected_type_name, found_type_id, .. }) => {
+//!             panic!("Expected type {} but got type_id {}", expected_type_name, found_type_id)
 //!         }
-//!         Err(RkyvVersionedError::UnsupportedVersionError(version)) => {
-//!             panic!("Found unsupported version {}", version)
+//!         Err(RkyvVersionedError::UnsupportedVersionError { found_version, newest_known_version, .. }) => {
+//!             panic!("Found version {}, newest known is {}", found_version, newest_known_version)
 //!         }
 //!         Err(RkyvVersionedError::RkyvError(rkyv_error)) => panic!("Rkyv error: {}", rkyv_error),
+//!         // RkyvVersionedError is #[non_exhaustive], so a catch-all arm is required
+//!         Err(other) => panic!("Unexpected error: {}", other),
 //!     };
 //! }
 //! ```
 //!
+//! # Container attributes
+//! The derive accepts one namespaced attribute, following rkyv's own attribute style:
+//!
+//! ```rust
+//! # use rkyv::{Archive, Serialize, Deserialize};
+//! # use rkyv_versioned::*;
+//! # #[derive(Debug, Archive, Serialize, Deserialize)]
+//! # struct EntryV1 { pub a: u32 }
+//! #[derive(Debug, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
+//! #[rkyv_versioned(archive_type_name = "fxv::BranchLedgerEntry")]
+//! enum BranchLedgerEntryContainer {
+//!     V1(EntryV1),
+//! }
+//! # assert_eq!(
+//! #     BranchLedgerEntryContainer::ARCHIVE_TYPE_NAME,
+//! #     "fxv::BranchLedgerEntry"
+//! # );
+//! ```
+//!
+//! `archive_type_name` pins the string that [VersionedContainer::ARCHIVE_TYPE_ID] is hashed
+//! from and that error messages report, instead of the container's identifier. Use it when two
+//! containers readable from the same store would otherwise share a name, or to keep the ID
+//! stable across a future rename of the type. Setting or changing it changes the stored type
+//! ID, so pick it before writing data, not after.
+//!
+//! # Buffer contract
+//! A tagged byte array must be handed back to the accessors exactly as it came out of
+//! [to_tagged_bytes] or [to_tagged_bytes_in]. rkyv locates the archived root from the *end* of
+//! the buffer, so a buffer with trailing bytes reads the header from the wrong offset. The
+//! checked accessors report this as a validation error rather than returning wrong data, and
+//! [access_from_tagged_bytes_unchecked] has no way to notice.
+//!
+//! This matters when records are stored in fixed-size pages or slabs: keep the serialized
+//! length alongside the record and slice to it before reading, because the length cannot be
+//! recovered from the tagged bytes.
+//!
+//! Buffer alignment follows rkyv's usual rules for the archived type, and is checked by the
+//! checked accessors. `AlignedVec` satisfies it; a `Vec<u8>` filled from a file may not.
+//!
+//! # Reading across versions
+//! Destructuring the container at each read site, `let Container::V1(v1) = &container`, ties
+//! every one of those sites to a version. Adding a `V3` then means editing all of them, which
+//! is a hassle.
+//!
+//! Put the version knowledge in accessors on the archived container instead, and have reading
+//! code call those. Each accessor answers for every version, so no call site refers to a
+//! specific one:
+//!
+//! ```rust
+//! use rkyv::{Archive, Serialize, Deserialize};
+//! use rkyv_versioned::*;
+//!
+//! #[derive(Debug, Archive, Serialize, Deserialize)]
+//! struct EntryV1 {
+//!     pub revision: u32,
+//!     pub name: String,
+//! }
+//!
+//! #[derive(Debug, Archive, Serialize, Deserialize)]
+//! struct EntryV2 {
+//!     pub revision: u64,
+//!     pub name: String,
+//!     pub retired: bool,
+//! }
+//!
+//! #[derive(Debug, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
+//! enum EntryContainer {
+//!     V1(EntryV1),
+//!     V2(EntryV2),
+//! }
+//!
+//! impl ArchivedEntryContainer {
+//!     // V1 stored this narrower, so it widens here rather than at every call site
+//!     pub fn revision(&self) -> u64 {
+//!         match self {
+//!             ArchivedEntryContainer::V1(v1) => v1.revision.to_native() as u64,
+//!             ArchivedEntryContainer::V2(v2) => v2.revision.to_native(),
+//!         }
+//!     }
+//!
+//!     pub fn name(&self) -> &str {
+//!         match self {
+//!             ArchivedEntryContainer::V1(v1) => &v1.name,
+//!             ArchivedEntryContainer::V2(v2) => &v2.name,
+//!         }
+//!     }
+//!
+//!     // Added in V2. Older data answers with the documented default, so callers that do not
+//!     // care about the new field are unaffected.
+//!     pub fn retired(&self) -> bool {
+//!         match self {
+//!             ArchivedEntryContainer::V1(_) => false,
+//!             ArchivedEntryContainer::V2(v2) => v2.retired,
+//!         }
+//!     }
+//! }
+//!
+//! fn main() {
+//!     let bytes = to_tagged_bytes(&EntryContainer::V1(EntryV1 {
+//!         revision: 7,
+//!         name: "main".to_owned(),
+//!     }))
+//!     .unwrap();
+//!
+//!     // The same three calls would read V2 bytes, with no conversion and no allocation
+//!     let entry = access_from_tagged_bytes::<EntryContainer>(&bytes).unwrap();
+//!     assert_eq!(entry.revision(), 7);
+//!     assert_eq!(entry.name(), "main");
+//!     assert!(!entry.retired());
+//! }
+//! ```
+//!
+//! Reads stay zero-copy for every version, since an accessor returns data out of the mapped
+//! bytes and nothing is converted. Adding a `V3` makes each accessor's match non-exhaustive,
+//! so the compiler lists the accessors to extend and leaves call sites alone. Do not write a
+//! wildcard arm, which would silently answer for versions nobody has considered.
+//!
+//! An accessor can only hide a difference it can express in one return type. A field whose
+//! type genuinely differs between versions, such as a nested struct that changed, needs its
+//! own accessors on the nested type, or an accessor per leaf value.
+//!
+//! # Producing an owned latest version
+//! Reading is served by the accessors above. [VersionedUpgrade] covers the other case: code
+//! that needs an owned value of the newest type, which is what a pass that rewrites stored
+//! data into the latest version does.
+//!
+//! The trait is implemented by hand on the archived container type, as one match over every
+//! version. The last variant returns [MaybeUpgraded::Current] and every earlier variant
+//! converts to the latest type. Adding a version to the container makes that match
+//! non-exhaustive, so the compiler points at it until the new version is handled. An arm that
+//! deliberately refuses to convert older data, for instance when a format break makes it
+//! unreadable, returns [RkyvVersionedError::UpgradeNotSupported].
+//!
+//! [upgrade_from_tagged_bytes] returns a [MaybeUpgraded], which is the same idea as
+//! `std::borrow::Cow`: data already at the latest version stays zero-copy in the
+//! [MaybeUpgraded::Current] arm, and only older data pays for a conversion into
+//! [MaybeUpgraded::Upgraded]. It cannot be a `Cow`, because `T::Archived` does not implement
+//! `Deref<Target = T>` and the two arms have no common borrowed form.
+//!
+//! ```rust
+//! use rkyv::{Archive, Serialize, Deserialize};
+//! use rkyv_versioned::*;
+//!
+//! #[derive(Debug, Archive, Serialize, Deserialize)]
+//! struct TestStructV1 {
+//!     pub a: u32,
+//! }
+//!
+//! #[derive(Debug, Archive, Serialize, Deserialize)]
+//! struct TestStructV2 {
+//!     pub a: u64,
+//!     pub b: String,
+//! }
+//!
+//! #[derive(Debug, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
+//! enum TestVersionedContainer {
+//!     V1(TestStructV1),
+//!     V2(TestStructV2),
+//! }
+//!
+//! // One match holding every conversion. Adding a V3 breaks it until V3 is handled.
+//! impl VersionedUpgrade for ArchivedTestVersionedContainer {
+//!     type Latest = TestStructV2;
+//!
+//!     fn upgrade(&self) -> Result<MaybeUpgraded<'_, Self::Latest>, RkyvVersionedError> {
+//!         match self {
+//!             // `b` did not exist in V1, so it gets a default
+//!             ArchivedTestVersionedContainer::V1(v1) => Ok(MaybeUpgraded::Upgraded(TestStructV2 {
+//!                 a: v1.a.to_native() as u64,
+//!                 b: String::new(),
+//!             })),
+//!             ArchivedTestVersionedContainer::V2(v2) => Ok(MaybeUpgraded::Current(v2)),
+//!         }
+//!     }
+//! }
+//!
+//! fn main() {
+//!     let old_bytes = to_tagged_bytes(&TestVersionedContainer::V1(TestStructV1 { a: 7 })).unwrap();
+//!     let new_bytes = to_tagged_bytes(&TestVersionedContainer::V2(TestStructV2 {
+//!         a: 8,
+//!         b: "hello".to_owned(),
+//!     }))
+//!     .unwrap();
+//!
+//!     // Whichever version was stored, this yields the newest type
+//!     match upgrade_from_tagged_bytes::<TestVersionedContainer>(&old_bytes).unwrap() {
+//!         MaybeUpgraded::Upgraded(v2) => assert_eq!(v2.a, 7),
+//!         MaybeUpgraded::Current(_) => panic!("V1 needs converting"),
+//!     }
+//!
+//!     // The latest version is not converted, so it stays zero-copy
+//!     match upgrade_from_tagged_bytes::<TestVersionedContainer>(&new_bytes).unwrap() {
+//!         MaybeUpgraded::Current(v2_ref) => assert_eq!(v2_ref.b, "hello"),
+//!         MaybeUpgraded::Upgraded(_) => panic!("V2 is already the latest version"),
+//!     }
+//!
+//!     // A pass that rewrites stored data as the latest version uses into_owned, which
+//!     // deserializes the Current arm and returns the Upgraded arm as it is
+//!     let latest: TestStructV2 = upgrade_from_tagged_bytes::<TestVersionedContainer>(&old_bytes)
+//!         .unwrap()
+//!         .into_owned()
+//!         .unwrap();
+//!     let rewritten = to_tagged_bytes(&TestVersionedContainer::V2(latest)).unwrap();
+//!     assert_eq!(
+//!         get_type_and_version_from_tagged_bytes(&rewritten).unwrap().1,
+//!         TestVersionedContainer::NEWEST_VERSION_ID
+//!     );
+//! }
+//! ```
+//!
+//! Reference variants (`#[rkyv(with=InlineAsBox)] &'a TestStructV1`) archive to an
+//! `ArchivedBox`, so their match arms dereference it to reach the archived struct:
+//! `ArchivedTestVersionedContainer::V2(v2) => Ok(MaybeUpgraded::Current(&**v2))`.
+//!
 //! # Functions
 //! - [to_tagged_bytes]: Serializes a versioned container to a tagged byte stream, embedding
 //!   the type ID and the version ID of the variant along with the data.
+//! - [to_tagged_bytes_in]: As above, writing into a caller-supplied writer.
+//! - [get_type_and_version_from_tagged_bytes]: Reads the type and version IDs out of a tagged
+//!   byte stream without deserializing the data itself.
 //! - [access_from_tagged_bytes]: Deserializes a versioned container from a tagged byte stream
 //!   and validates type and version IDs.
+//! - [upgrade_from_tagged_bytes]: As above, then converts the result to the container's latest
+//!   version.
 //!
 //! # Traits
 //! - [VersionedContainer]: A trait that is automatically implemented on a versioned container
 //!   using the `#[derive(VersionedArchiveContainer)]` attribute.
+//! - [VersionedUpgrade]: A hand-written trait on the archived container type, converting any
+//!   version of a container to its latest one as a [MaybeUpgraded]. For reading stored data,
+//!   prefer accessors on the archived container (see "Reading across versions"); this is for
+//!   code that needs an owned value of the newest type.
 //!
 //! # Error Types
 //! Given that introspection of the deserialization errors are more useful in this context
@@ -126,8 +351,13 @@
 //! - [TaggedVersionedStruct]: A container that includes type and version IDs along with the
 //!   data.
 
+// The derive macro emits fully qualified `::rkyv_versioned::` paths so that users do not have
+// to glob-import this crate. That path has to resolve inside this crate too, for its own
+// tests.
+extern crate self as rkyv_versioned;
+
 use core::{error::Error, fmt};
-use rkyv::api::high::HighSerializer;
+use rkyv::api::high::{HighDeserializer, HighSerializer};
 use rkyv::ser::allocator::ArenaHandle;
 use rkyv::util::AlignedVec;
 use rkyv::with::InlineAsBox;
@@ -137,25 +367,79 @@ use rkyv::{Archive, Serialize};
 pub use const_crc32;
 pub use rkyv_versioned_derive::VersionedArchiveContainer;
 
+/// The errors this crate produces.
+///
+/// Marked `#[non_exhaustive]`, so matches outside this crate need a catch-all arm and adding a
+/// variant is not a breaking change.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum RkyvVersionedError {
     BufferTooSmallError,
-    UnexpectedTypeError(u32, u32),
-    UnsupportedVersionError(u32),
+    /// The tagged bytes hold a different type to the one that was asked for. Only the
+    /// expected type's name is available: `found_type_id` is a CRC32 with no reverse
+    /// lookup.
+    UnexpectedTypeError {
+        expected_type_name: &'static str,
+        expected_type_id: u32,
+        found_type_id: u32,
+    },
+    /// The tagged bytes hold a version this build does not know about, which usually means
+    /// the data was written by a newer build.
+    UnsupportedVersionError {
+        type_name: &'static str,
+        found_version: u32,
+        newest_known_version: u32,
+    },
+    /// An older version was read but cannot be converted to the latest one. Returned by
+    /// [VersionedUpgrade] conversions that deliberately refuse to upgrade.
+    UpgradeNotSupported {
+        type_name: &'static str,
+        from_version: u32,
+    },
     RkyvError(rkyv::rancor::Error),
 }
-impl Error for RkyvVersionedError {}
+impl Error for RkyvVersionedError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            RkyvVersionedError::RkyvError(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 impl fmt::Display for RkyvVersionedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RkyvVersionedError::BufferTooSmallError => {
                 write!(f, "Buffer was less than the size of the header")
             }
-            RkyvVersionedError::UnexpectedTypeError(expected, got) => {
-                write!(f, "Expected type_id {expected}, got {got}")
+            RkyvVersionedError::UnexpectedTypeError {
+                expected_type_name,
+                expected_type_id,
+                found_type_id,
+            } => {
+                write!(
+                    f,
+                    "Expected type {expected_type_name} (type_id {expected_type_id}), got type_id {found_type_id}"
+                )
             }
-            RkyvVersionedError::UnsupportedVersionError(version) => {
-                write!(f, "Unsupported version {version}")
+            RkyvVersionedError::UnsupportedVersionError {
+                type_name,
+                found_version,
+                newest_known_version,
+            } => {
+                write!(
+                    f,
+                    "{type_name}: unsupported version {found_version} (newest known: {newest_known_version})"
+                )
+            }
+            RkyvVersionedError::UpgradeNotSupported {
+                type_name,
+                from_version,
+            } => {
+                write!(
+                    f,
+                    "{type_name}: cannot upgrade data written as version {from_version}"
+                )
             }
             RkyvVersionedError::RkyvError(e) => write!(f, "{e}"),
         }
@@ -186,11 +470,10 @@ pub struct TaggedVersionedStruct<'a, T: Archive> {
 /// # Returns
 ///
 /// A `Result` containing either the serialized byte array or an error if serialization fails.
-pub fn to_tagged_bytes<T>(
-    item: &T,
-) -> Result<AlignedVec, RkyvVersionedError>
+pub fn to_tagged_bytes<T>(item: &T) -> Result<AlignedVec, RkyvVersionedError>
 where
-    T: VersionedContainer + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rkyv::rancor::Error>>,
+    T: VersionedContainer
+        + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rkyv::rancor::Error>>,
 {
     let container = TaggedVersionedStruct {
         type_id: T::ARCHIVE_TYPE_ID,
@@ -212,12 +495,10 @@ where
 /// # Returns
 ///
 /// A `Result` containing either the serialized byte array or an error if serialization fails.
-pub fn to_tagged_bytes_in<T, W>(
-    item: &T,
-    writer: W,
-) -> Result<W, RkyvVersionedError>
+pub fn to_tagged_bytes_in<T, W>(item: &T, writer: W) -> Result<W, RkyvVersionedError>
 where
-    T: VersionedContainer + for<'a> Serialize<HighSerializer<W, ArenaHandle<'a>, rkyv::rancor::Error>>,
+    T: VersionedContainer
+        + for<'a> Serialize<HighSerializer<W, ArenaHandle<'a>, rkyv::rancor::Error>>,
     W: rkyv::ser::Writer<rkyv::rancor::Error>,
 {
     let container = TaggedVersionedStruct {
@@ -234,6 +515,14 @@ where
 ///
 /// This is useful in the context of pre-validating the type and version of a tagged byte array
 /// before deserializing.
+///
+/// The returned `version_id` is the one written into the header at serialization time. Nothing
+/// cross-checks it against the variant actually stored, so use it to decide whether the data
+/// is readable at all, and match on the archived enum returned by [access_from_tagged_bytes]
+/// to decide what the data is.
+///
+/// `buf` must be exactly the bytes produced for one item, per the buffer contract described in
+/// the crate documentation.
 ///
 /// # Arguments
 ///
@@ -261,6 +550,9 @@ pub fn get_type_and_version_from_tagged_bytes(
 /// Zero-copy deserializes a versioned container from a tagged byte array generated by
 /// [to_tagged_bytes].
 ///
+/// `buf` must be exactly the bytes produced for one item, per the buffer contract described in
+/// the crate documentation.
+///
 /// # Arguments
 ///
 /// * `buf` - A reference to the byte array containing the tagged serialized data.
@@ -282,10 +574,11 @@ where
 
     // Ensure the type header is correct
     if type_id != T::ARCHIVE_TYPE_ID {
-        return Err(RkyvVersionedError::UnexpectedTypeError(
-            T::ARCHIVE_TYPE_ID,
-            type_id,
-        ));
+        return Err(RkyvVersionedError::UnexpectedTypeError {
+            expected_type_name: T::ARCHIVE_TYPE_NAME,
+            expected_type_id: T::ARCHIVE_TYPE_ID,
+            found_type_id: type_id,
+        });
     }
 
     // Ensure the version header is valid
@@ -295,7 +588,11 @@ where
                 .map_err(RkyvVersionedError::RkyvError)?;
         Ok(&archived.inner)
     } else {
-        Err(RkyvVersionedError::UnsupportedVersionError(version_id))
+        Err(RkyvVersionedError::UnsupportedVersionError {
+            type_name: T::ARCHIVE_TYPE_NAME,
+            found_version: version_id,
+            newest_known_version: T::NEWEST_VERSION_ID,
+        })
     }
 }
 
@@ -310,14 +607,25 @@ where
 ///
 /// A reference to the inner archived type
 ///
-/// # SAFETY
-/// This function is unsafe because it does not perform any validation on the type or version
-/// ID or the underlying bytes. It is only recommended to use this when you have either already
-/// validated the buffer, or are just passing the data around internally.
+/// # Safety
+/// This function performs no validation of the type ID, the version ID, or the underlying
+/// bytes. Use it only when the buffer has already been validated, or when passing data around
+/// internally. The caller must guarantee all of:
+///
+/// - `buf` was produced by [to_tagged_bytes] or [to_tagged_bytes_in] for this same `T`.
+/// - `buf` is exactly those bytes, with nothing appended. The archived root is located from
+///   the end of the buffer, so trailing bytes make this read from the wrong offset.
+/// - `buf` satisfies rkyv's usual alignment requirement for the archived type. This is the
+///   same contract as `rkyv::access_unchecked` and is relaxed by rkyv's `unaligned` feature.
+///
+/// Failing any of these is undefined behavior. [access_from_tagged_bytes] reports all three as
+/// errors instead.
 pub unsafe fn access_from_tagged_bytes_unchecked<'a, T: VersionedContainer + 'a>(
     buf: &'a [u8],
 ) -> &'a T::Archived {
-    let archived = rkyv::access_unchecked::<ArchivedTaggedVersionedStruct<T>>(buf);
+    // SAFETY: the caller guarantees `buf` holds exactly one tagged `T`, aligned, as documented
+    // above. Everything this reads is then in bounds and correctly typed.
+    let archived = unsafe { rkyv::access_unchecked::<ArchivedTaggedVersionedStruct<T>>(buf) };
     &archived.inner
 }
 
@@ -329,12 +637,33 @@ pub unsafe fn access_from_tagged_bytes_unchecked<'a, T: VersionedContainer + 'a>
 /// methods for validating version IDs, retrieving the version ID of an entry,
 /// and converting between tagged bytes and archived data.
 ///
-/// # Example
-/// TODO
+/// Implement it only on sized types. [get_type_and_version_from_tagged_bytes] reads the header
+/// by accessing the buffer as `TaggedVersionedStruct<()>`, which lands on the right bytes
+/// because the archived pointer to a sized payload is the same size whatever the payload is.
 pub trait VersionedContainer: Archive {
     /// A constant representing the type ID of the archived data. When generated by
     /// the derive macro, this is a CRC32 hash of the type name.
+    ///
+    /// The name defaults to the bare identifier, without its module path, so two containers of
+    /// the same name in different modules produce the same ID, and CRC32 collisions are
+    /// possible in general. Where several containers can be read from one store, assert their
+    /// IDs are distinct, and pin a unique name with
+    /// `#[rkyv_versioned(archive_type_name = "...")]` where they are not.
+    ///
+    /// This ID is written into every serialized record, so neither how it is derived nor the
+    /// name it is derived from can change without invalidating data already stored. Module
+    /// paths deliberately do not contribute to it: moving or renaming a module would otherwise
+    /// silently change the ID of every record already written.
     const ARCHIVE_TYPE_ID: u32;
+
+    /// The name of the container type, used to make error messages diagnosable. When generated
+    /// by the derive macro, this is the container's identifier as written in the source.
+    const ARCHIVE_TYPE_NAME: &'static str;
+
+    /// The highest version ID this build knows about, i.e. the ID of the last variant.
+    /// Reported in [RkyvVersionedError::UnsupportedVersionError] so a reader can tell
+    /// "written by a newer build" from "not a version at all".
+    const NEWEST_VERSION_ID: u32;
 
     /// Checks if the provided version ID is valid.
     fn is_valid_version_id(version: u32) -> bool;
@@ -343,12 +672,101 @@ pub trait VersionedContainer: Archive {
     fn get_entry_version_id(&self) -> u32;
 }
 
+/// The result of upgrading a versioned container to its latest version, borrowed when the data
+/// was already at the latest version and owned when it had to be converted.
+///
+/// This is the same idea as `std::borrow::Cow`, but it cannot be `Cow`: `T::Archived` does not
+/// implement `Deref<Target = T>`, so the two arms have no common borrowed form.
+#[derive(Debug)]
+pub enum MaybeUpgraded<'a, T: Archive> {
+    /// The data was already the latest version, so it is still zero-copy.
+    Current(&'a T::Archived),
+    /// The data was an older version and was converted to the latest one.
+    Upgraded(T),
+}
+
+impl<T: Archive> MaybeUpgraded<'_, T>
+where
+    T::Archived: rkyv::Deserialize<T, HighDeserializer<rkyv::rancor::Error>>,
+{
+    /// Produces an owned latest-version value, deserializing the [MaybeUpgraded::Current] arm.
+    ///
+    /// A pass that rewrites stored data as the latest version uses this: read each record
+    /// through [VersionedUpgrade::upgrade], call `into_owned`, and write it back.
+    pub fn into_owned(self) -> Result<T, RkyvVersionedError> {
+        match self {
+            MaybeUpgraded::Current(archived) => {
+                rkyv::deserialize::<T, rkyv::rancor::Error>(archived)
+                    .map_err(RkyvVersionedError::RkyvError)
+            }
+            MaybeUpgraded::Upgraded(owned) => Ok(owned),
+        }
+    }
+}
+
+/// Converts any version of a container to its latest version, for code that needs an owned
+/// value of the newest type.
+///
+/// Reading stored data does not need this. Accessors on the archived container answer for
+/// every version with no conversion at all, so no call site refers to a specific version; see
+/// "Reading across versions" in the crate documentation. This trait covers the other case,
+/// such as a pass that rewrites stored records into the latest version.
+///
+/// This is implemented by hand on the *archived* container type, as a single match over every
+/// version. The last variant returns [MaybeUpgraded::Current], which stays zero-copy, and
+/// every earlier variant converts to [VersionedUpgrade::Latest]. Adding a new version to the
+/// container makes that match non-exhaustive, so it fails to compile until the new version is
+/// handled. Do not add a wildcard arm, which would silently accept versions nobody has thought
+/// about.
+///
+/// An arm that deliberately refuses to upgrade older data, for instance when a format break
+/// makes it unreadable, returns [RkyvVersionedError::UpgradeNotSupported].
+///
+/// See the crate documentation for a worked example.
+pub trait VersionedUpgrade {
+    /// The type held by the container's last variant.
+    type Latest: Archive;
+
+    /// Converts an archived container of any version to [VersionedUpgrade::Latest].
+    fn upgrade(&self) -> Result<MaybeUpgraded<'_, Self::Latest>, RkyvVersionedError>;
+}
+
+/// Zero-copy deserializes a versioned container from a tagged byte array generated by
+/// [to_tagged_bytes] and upgrades it to its latest version.
+///
+/// This is [access_from_tagged_bytes] followed by [VersionedUpgrade::upgrade], which is what a
+/// read site that only wants the latest version needs.
+///
+/// # Arguments
+///
+/// * `buf` - A reference to the byte array containing the tagged serialized data.
+///
+/// # Returns
+///
+/// A `Result` containing either the latest version of the data, borrowed or owned, or an error
+/// if deserialization or the upgrade fails.
+pub fn upgrade_from_tagged_bytes<'a, T: VersionedContainer + 'a>(
+    buf: &'a [u8],
+) -> Result<MaybeUpgraded<'a, <T::Archived as VersionedUpgrade>::Latest>, RkyvVersionedError>
+where
+    T::Archived: VersionedUpgrade
+        + rkyv::Portable
+        + for<'b> rkyv::bytecheck::CheckBytes<
+            rkyv::api::high::HighValidator<'b, rkyv::rancor::Error>,
+        >,
+{
+    access_from_tagged_bytes::<T>(buf)?.upgrade()
+}
+
 #[cfg(test)]
 mod tests {
-    use core::panic;
-
     use super::*;
     use rkyv::Deserialize;
+
+    // Longer strings are serialized out-of-line in the data, so the fixtures use one to keep
+    // that case covered
+    const V1_STRING: &str = "YEEEEEEEEEEEEEEEEEEEET";
+    const V2_STRING: &str = "SKEEEEEEEEEEEEEEEEEEET";
 
     #[derive(Debug, PartialEq, Archive, Serialize, Deserialize)]
     #[rkyv(compare(PartialEq))]
@@ -381,84 +799,203 @@ mod tests {
         V2(TestStructV2),
     }
 
+    /// A container that pins the string its type ID is hashed from, so that moving or renaming
+    /// the type cannot change the ID.
+    #[derive(Debug, PartialEq, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
+    #[rkyv_versioned(archive_type_name = "rkyv_versioned::TestContainerRenamed")]
+    enum TestContainerNamed {
+        V1(TestStructV1),
+    }
 
-    #[test]
-    fn test_versioned_container_owned() {
-        // Longer strings will be serialized out-of-line in the data, so it is important to
-        // test that scenario
-        let v1 = TestStructV1 {
+    /// A container that has only ever had one version, so every upgrade is a no-op.
+    #[derive(Debug, PartialEq, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
+    #[rkyv(compare(PartialEq))]
+    enum TestContainerSingle {
+        V1(TestStructV1),
+    }
+
+    /// `c` has no counterpart in V1, so it gets a default.
+    fn v2_from_archived_v1(v1: &ArchivedTestStructV1) -> TestStructV2 {
+        TestStructV2 {
+            a: v1.a.to_native() as u64,
+            b: v1.b.to_native() as u64,
+            c: 0,
+            d: v1.c.to_string(),
+        }
+    }
+
+    impl VersionedUpgrade for ArchivedTestContainerOwned {
+        type Latest = TestStructV2;
+
+        fn upgrade(&self) -> Result<MaybeUpgraded<'_, Self::Latest>, RkyvVersionedError> {
+            match self {
+                ArchivedTestContainerOwned::V1(v1) => {
+                    Ok(MaybeUpgraded::Upgraded(v2_from_archived_v1(v1)))
+                }
+                ArchivedTestContainerOwned::V2(v2) => Ok(MaybeUpgraded::Current(v2)),
+            }
+        }
+    }
+
+    // Reference variants archive through `InlineAsBox`, so the arms dereference the
+    // `ArchivedBox` to reach the archived struct
+    impl VersionedUpgrade for ArchivedTestContainerRef<'_> {
+        type Latest = TestStructV2;
+
+        fn upgrade(&self) -> Result<MaybeUpgraded<'_, Self::Latest>, RkyvVersionedError> {
+            match self {
+                ArchivedTestContainerRef::V1(v1) => {
+                    Ok(MaybeUpgraded::Upgraded(v2_from_archived_v1(v1)))
+                }
+                ArchivedTestContainerRef::V2(v2) => Ok(MaybeUpgraded::Current(&**v2)),
+            }
+        }
+    }
+
+    impl VersionedUpgrade for ArchivedTestContainerSingle {
+        type Latest = TestStructV1;
+
+        fn upgrade(&self) -> Result<MaybeUpgraded<'_, Self::Latest>, RkyvVersionedError> {
+            match self {
+                ArchivedTestContainerSingle::V1(v1) => Ok(MaybeUpgraded::Current(v1)),
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Archive, Serialize, Deserialize)]
+    struct LegacyStructV1 {
+        pub a: u32,
+    }
+
+    #[derive(Debug, PartialEq, Archive, Serialize, Deserialize)]
+    struct LegacyStructV2 {
+        pub a: u64,
+    }
+
+    /// A container whose old version is declared but deliberately not convertible.
+    #[derive(Debug, PartialEq, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
+    enum TestContainerLegacyRefused {
+        V1(LegacyStructV1),
+        V2(LegacyStructV2),
+    }
+
+    impl VersionedUpgrade for ArchivedTestContainerLegacyRefused {
+        type Latest = LegacyStructV2;
+
+        fn upgrade(&self) -> Result<MaybeUpgraded<'_, Self::Latest>, RkyvVersionedError> {
+            match self {
+                ArchivedTestContainerLegacyRefused::V1(_) => {
+                    Err(RkyvVersionedError::UpgradeNotSupported {
+                        type_name: TestContainerLegacyRefused::ARCHIVE_TYPE_NAME,
+                        from_version: 0,
+                    })
+                }
+                ArchivedTestContainerLegacyRefused::V2(v2) => Ok(MaybeUpgraded::Current(v2)),
+            }
+        }
+    }
+
+    fn make_v1() -> TestStructV1 {
+        TestStructV1 {
             a: 1,
             b: 2,
-            c: "YEEEEEEEEEEEEEEEEEEEET".to_owned(),
-        };
-        let v1_container = TestContainerOwned::V1(v1);
-
-        let tswv_container_bytes: AlignedVec =
-            to_tagged_bytes::<TestContainerOwned>(&v1_container).unwrap();
-        assert_eq!(
-            get_type_and_version_from_tagged_bytes(&tswv_container_bytes).unwrap(),
-            (
-                TestContainerOwned::ARCHIVE_TYPE_ID,
-                v1_container.get_entry_version_id()
-            )
-        );
-
-        // Validate that the trait impl and the bare impl both give the same result
-        let twsv_ref =
-            access_from_tagged_bytes::<TestContainerOwned>(&tswv_container_bytes).unwrap();
-
-        match twsv_ref {
-            ArchivedTestContainerOwned::V1(v1_ref) => {
-                assert_eq!(v1_ref.a, 1);
-                assert_eq!(v1_ref.b, 2);
-                assert_eq!(v1_ref.c, "YEEEEEEEEEEEEEEEEEEEET");
-            }
-            _ => panic!("Expected V1"),
+            c: V1_STRING.to_owned(),
         }
+    }
 
-        // Validate unchecked version is the same
-        let twsv_ref_unchecked = unsafe { access_from_tagged_bytes_unchecked::<TestContainerOwned>(&tswv_container_bytes) };
-        match twsv_ref_unchecked {
-            ArchivedTestContainerOwned::V1(v1_ref) => {
-                assert_eq!(v1_ref.a, 1);
-                assert_eq!(v1_ref.b, 2);
-                assert_eq!(v1_ref.c, "YEEEEEEEEEEEEEEEEEEEET");
-            }
-            _ => panic!("Expected V1"),
-        }
-
-        let v2 = TestStructV2 {
+    fn make_v2() -> TestStructV2 {
+        TestStructV2 {
             a: 100,
             b: 200,
             c: 300,
-            d: "SKEET".to_owned(),
-        };
-        let v2_container = TestContainerOwned::V2(v2);
-        let tswv_container_bytes: AlignedVec = to_tagged_bytes(&v2_container).unwrap();
-        assert_eq!(
-            get_type_and_version_from_tagged_bytes(&tswv_container_bytes).unwrap(),
-            (
-                TestContainerOwned::ARCHIVE_TYPE_ID,
-                v2_container.get_entry_version_id()
-            )
-        );
-        let twsv_ref =
-            access_from_tagged_bytes::<TestContainerOwned>(&tswv_container_bytes).unwrap();
+            d: V2_STRING.to_owned(),
+        }
+    }
 
-        match twsv_ref {
-            ArchivedTestContainerOwned::V2(v2_ref) => {
-                assert_eq!(v2_ref.a, 100);
-                assert_eq!(v2_ref.b, 200);
-                assert_eq!(v2_ref.c, 300);
-                assert_eq!(v2_ref.d, "SKEET");
-            }
-            _ => panic!("Expected V2"),
+    fn assert_archived_v1(archived: &ArchivedTestStructV1) {
+        assert_eq!(archived.a, 1);
+        assert_eq!(archived.b, 2);
+        assert_eq!(archived.c, V1_STRING);
+    }
+
+    fn assert_archived_v2(archived: &ArchivedTestStructV2) {
+        assert_eq!(archived.a, 100);
+        assert_eq!(archived.b, 200);
+        assert_eq!(archived.c, 300);
+        assert_eq!(archived.d, V2_STRING);
+    }
+
+    /// Serializes a container, checks the tag matches what the container reports, and returns
+    /// the bytes.
+    fn round_trip_bytes<T>(container: &T) -> AlignedVec
+    where
+        T: VersionedContainer
+            + for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rkyv::rancor::Error>>,
+    {
+        let bytes = to_tagged_bytes(container).unwrap();
+        assert_eq!(
+            get_type_and_version_from_tagged_bytes(&bytes).unwrap(),
+            (T::ARCHIVE_TYPE_ID, container.get_entry_version_id())
+        );
+        bytes
+    }
+
+    #[test]
+    fn test_versioned_container_owned() {
+        let v1_bytes = round_trip_bytes(&TestContainerOwned::V1(make_v1()));
+
+        match access_from_tagged_bytes::<TestContainerOwned>(&v1_bytes).unwrap() {
+            ArchivedTestContainerOwned::V1(v1_ref) => assert_archived_v1(v1_ref),
+            _ => panic!("Expected V1"),
         }
 
+        // The unchecked access must produce the same thing
+        match unsafe { access_from_tagged_bytes_unchecked::<TestContainerOwned>(&v1_bytes) } {
+            ArchivedTestContainerOwned::V1(v1_ref) => assert_archived_v1(v1_ref),
+            _ => panic!("Expected V1"),
+        }
+
+        let v2_bytes = round_trip_bytes(&TestContainerOwned::V2(make_v2()));
+
+        match access_from_tagged_bytes::<TestContainerOwned>(&v2_bytes).unwrap() {
+            ArchivedTestContainerOwned::V2(v2_ref) => assert_archived_v2(v2_ref),
+            _ => panic!("Expected V2"),
+        }
+    }
+
+    #[test]
+    fn test_versioned_container_ref() {
+        let v1 = make_v1();
+        let v1_bytes = round_trip_bytes(&TestContainerRef::V1(&v1));
+
+        match access_from_tagged_bytes::<TestContainerRef>(&v1_bytes).unwrap() {
+            ArchivedTestContainerRef::V1(v1_ref) => assert_archived_v1(v1_ref),
+            _ => panic!("Expected V1"),
+        }
+
+        // The unchecked access must produce the same thing
+        match unsafe { access_from_tagged_bytes_unchecked::<TestContainerRef>(&v1_bytes) } {
+            ArchivedTestContainerRef::V1(v1_ref) => assert_archived_v1(v1_ref),
+            _ => panic!("Expected V1"),
+        }
+
+        let v2 = make_v2();
+        let v2_bytes = round_trip_bytes(&TestContainerRef::V2(&v2));
+
+        match access_from_tagged_bytes::<TestContainerRef>(&v2_bytes).unwrap() {
+            ArchivedTestContainerRef::V2(v2_ref) => assert_archived_v2(v2_ref),
+            _ => panic!("Expected V2"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_headers() {
         const EXPECTED_TYPE_ID: u32 = const_crc32::crc32("TestContainerOwned".as_bytes());
         const MUNGED_TYPE_ID: u32 = 0x01010101;
+        const MUNGED_VERSION_ID: u32 = 0x01010101;
 
-        // Generate invalid type id
+        let v1_container = TestContainerOwned::V1(make_v1());
+
         let invalid_type_struct = TaggedVersionedStruct::<TestContainerOwned> {
             type_id: MUNGED_TYPE_ID,
             version_id: 0,
@@ -468,142 +1005,233 @@ mod tests {
             rkyv::to_bytes::<rkyv::rancor::Error>(&invalid_type_struct).unwrap();
 
         match access_from_tagged_bytes::<TestContainerOwned>(&invalid_type_bytes) {
-            Err(RkyvVersionedError::UnexpectedTypeError(expected, got)) => {
-                assert_eq!(expected, EXPECTED_TYPE_ID);
-                assert_eq!(got, MUNGED_TYPE_ID);
+            Err(RkyvVersionedError::UnexpectedTypeError {
+                expected_type_name,
+                expected_type_id,
+                found_type_id,
+            }) => {
+                assert_eq!(expected_type_name, "TestContainerOwned");
+                assert_eq!(expected_type_id, EXPECTED_TYPE_ID);
+                assert_eq!(found_type_id, MUNGED_TYPE_ID);
             }
             _ => panic!("Expected RkyvVersionedError::UnexpectedTypeError"),
         };
 
-        // Generate invalid version id
-        const MUNGED_VERSION_ID: u32 = 0x01010101;
         let invalid_version_struct = TaggedVersionedStruct::<TestContainerOwned> {
             type_id: EXPECTED_TYPE_ID,
             version_id: MUNGED_VERSION_ID,
             inner: &v1_container,
         };
-
         let invalid_version_bytes =
             rkyv::to_bytes::<rkyv::rancor::Error>(&invalid_version_struct).unwrap();
 
         match access_from_tagged_bytes::<TestContainerOwned>(&invalid_version_bytes) {
-            Err(RkyvVersionedError::UnsupportedVersionError(version)) => {
-                assert_eq!(version, MUNGED_VERSION_ID);
+            Err(RkyvVersionedError::UnsupportedVersionError {
+                type_name,
+                found_version,
+                newest_known_version,
+            }) => {
+                assert_eq!(type_name, "TestContainerOwned");
+                assert_eq!(found_version, MUNGED_VERSION_ID);
+                assert_eq!(newest_known_version, TestContainerOwned::NEWEST_VERSION_ID);
             }
             _ => panic!("Expected RkyvVersionedError::UnsupportedVersionError"),
+        };
+
+        // A buffer shorter than the header cannot be tagged data at all
+        match get_type_and_version_from_tagged_bytes(&[0u8; 4]) {
+            Err(RkyvVersionedError::BufferTooSmallError) => {}
+            _ => panic!("Expected RkyvVersionedError::BufferTooSmallError"),
         };
     }
 
-    
+    /// The header peek accesses the buffer as `TaggedVersionedStruct<()>`, so that type must
+    /// have the same layout as one holding an actual payload, whatever the payload contains.
     #[test]
-    fn test_versioned_container_ref() {
-        // Longer strings will be serialized out-of-line in the data, so it is important to
-        // test that scenario
-        let v1 = TestStructV1 {
-            a: 1,
-            b: 2,
-            c: "YEEEEEEEEEEEEEEEEEEEET".to_owned(),
-        };
-        let v1_container = TestContainerRef::V1(&v1);
-
-        let tswv_container_bytes: AlignedVec =
-            to_tagged_bytes::<TestContainerRef>(&v1_container).unwrap();
+    fn test_header_layout_is_payload_independent() {
         assert_eq!(
-            get_type_and_version_from_tagged_bytes(&tswv_container_bytes).unwrap(),
-            (
-                TestContainerRef::ARCHIVE_TYPE_ID,
-                v1_container.get_entry_version_id()
-            )
+            size_of::<ArchivedTaggedVersionedStruct<()>>(),
+            size_of::<ArchivedTaggedVersionedStruct<TestContainerOwned>>()
+        );
+        assert_eq!(
+            align_of::<ArchivedTaggedVersionedStruct<()>>(),
+            align_of::<ArchivedTaggedVersionedStruct<TestContainerOwned>>()
         );
 
-        // Validate that the trait impl and the bare impl both give the same result
-        let twsv_ref =
-            access_from_tagged_bytes::<TestContainerRef>(&tswv_container_bytes).unwrap();
-
-        match twsv_ref {
-            ArchivedTestContainerRef::V1(v1_ref) => {
-                assert_eq!(v1_ref.a, 1);
-                assert_eq!(v1_ref.b, 2);
-                assert_eq!(v1_ref.c, "YEEEEEEEEEEEEEEEEEEEET");
-            }
-            _ => panic!("Expected V1"),
-        }
-
-        // Validate unchecked version is the same
-        let twsv_ref_unchecked = unsafe { access_from_tagged_bytes_unchecked::<TestContainerRef>(&tswv_container_bytes) };
-        match twsv_ref_unchecked {
-            ArchivedTestContainerRef::V1(v1_ref) => {
-                assert_eq!(v1_ref.a, 1);
-                assert_eq!(v1_ref.b, 2);
-                assert_eq!(v1_ref.c, "YEEEEEEEEEEEEEEEEEEEET");
-            }
-            _ => panic!("Expected V1"),
-        }
-
-        let v2 = TestStructV2 {
-            a: 100,
-            b: 200,
-            c: 300,
-            d: "SKEET".to_owned(),
-        };
-        let v2_container = TestContainerOwned::V2(v2);
-        let tswv_container_bytes: AlignedVec = to_tagged_bytes(&v2_container).unwrap();
+        // TestContainerRef holds its payload by reference, TestContainerLegacyRefused is all
+        // small scalars, and TestStructV2 forces an 8-byte alignment on its own
         assert_eq!(
-            get_type_and_version_from_tagged_bytes(&tswv_container_bytes).unwrap(),
-            (
-                TestContainerOwned::ARCHIVE_TYPE_ID,
-                v2_container.get_entry_version_id()
-            )
+            size_of::<ArchivedTaggedVersionedStruct<()>>(),
+            size_of::<ArchivedTaggedVersionedStruct<TestContainerRef>>()
         );
-        let twsv_ref =
-            access_from_tagged_bytes::<TestContainerOwned>(&tswv_container_bytes).unwrap();
+        assert_eq!(
+            size_of::<ArchivedTaggedVersionedStruct<()>>(),
+            size_of::<ArchivedTaggedVersionedStruct<TestContainerLegacyRefused>>()
+        );
+    }
 
-        match twsv_ref {
-            ArchivedTestContainerOwned::V2(v2_ref) => {
-                assert_eq!(v2_ref.a, 100);
-                assert_eq!(v2_ref.b, 200);
-                assert_eq!(v2_ref.c, 300);
-                assert_eq!(v2_ref.d, "SKEET");
-            }
-            _ => panic!("Expected V2"),
-        }
+    /// Trailing bytes move the archived root, which the checked accessors must reject rather
+    /// than read past.
+    #[test]
+    fn test_trailing_bytes_are_rejected() {
+        let bytes = to_tagged_bytes(&TestContainerOwned::V1(make_v1())).unwrap();
+        let mut padded = bytes.to_vec();
+        padded.extend_from_slice(&[0u8; 16]);
 
-        const EXPECTED_TYPE_ID: u32 = const_crc32::crc32("TestContainerOwned".as_bytes());
-        const MUNGED_TYPE_ID: u32 = 0x01010101;
+        assert!(get_type_and_version_from_tagged_bytes(&padded).is_err());
+        assert!(access_from_tagged_bytes::<TestContainerOwned>(&padded).is_err());
+    }
 
-        // Generate invalid type id
-        let invalid_type_struct = TaggedVersionedStruct::<TestContainerRef> {
-            type_id: MUNGED_TYPE_ID,
-            version_id: 0,
-            inner: &v1_container,
-        };
-        let invalid_type_bytes =
-            rkyv::to_bytes::<rkyv::rancor::Error>(&invalid_type_struct).unwrap();
+    /// The override decides both the reported name and the hashed type ID, and it is the ID
+    /// stored in the data, so a container that pins it survives being moved or renamed.
+    #[test]
+    fn test_archive_type_name_override() {
+        const PINNED: &str = "rkyv_versioned::TestContainerRenamed";
 
-        match access_from_tagged_bytes::<TestContainerOwned>(&invalid_type_bytes) {
-            Err(RkyvVersionedError::UnexpectedTypeError(expected, got)) => {
-                assert_eq!(expected, EXPECTED_TYPE_ID);
-                assert_eq!(got, MUNGED_TYPE_ID);
+        assert_eq!(TestContainerNamed::ARCHIVE_TYPE_NAME, PINNED);
+        assert_eq!(
+            TestContainerNamed::ARCHIVE_TYPE_ID,
+            const_crc32::crc32(PINNED.as_bytes())
+        );
+        assert_ne!(
+            TestContainerNamed::ARCHIVE_TYPE_ID,
+            const_crc32::crc32("TestContainerNamed".as_bytes())
+        );
+
+        // The pinned ID is what round-trips, and it reaches error messages
+        let bytes = to_tagged_bytes(&TestContainerNamed::V1(make_v1())).unwrap();
+        assert_eq!(
+            get_type_and_version_from_tagged_bytes(&bytes).unwrap().0,
+            TestContainerNamed::ARCHIVE_TYPE_ID
+        );
+        assert!(access_from_tagged_bytes::<TestContainerNamed>(&bytes).is_ok());
+
+        match access_from_tagged_bytes::<TestContainerOwned>(&bytes) {
+            Err(RkyvVersionedError::UnexpectedTypeError { found_type_id, .. }) => {
+                assert_eq!(found_type_id, TestContainerNamed::ARCHIVE_TYPE_ID);
             }
             _ => panic!("Expected RkyvVersionedError::UnexpectedTypeError"),
+        }
+    }
+
+    #[test]
+    fn test_error_context() {
+        assert_eq!(TestContainerOwned::ARCHIVE_TYPE_NAME, "TestContainerOwned");
+        assert_eq!(TestContainerOwned::NEWEST_VERSION_ID, 1);
+        assert_eq!(TestContainerRef::ARCHIVE_TYPE_NAME, "TestContainerRef");
+        assert_eq!(TestContainerRef::NEWEST_VERSION_ID, 1);
+        assert_eq!(TestContainerSingle::NEWEST_VERSION_ID, 0);
+
+        // Error messages must identify the container by name, not by bare integers
+        let unexpected_type = RkyvVersionedError::UnexpectedTypeError {
+            expected_type_name: TestContainerOwned::ARCHIVE_TYPE_NAME,
+            expected_type_id: 7,
+            found_type_id: 9,
         };
+        assert_eq!(
+            unexpected_type.to_string(),
+            "Expected type TestContainerOwned (type_id 7), got type_id 9"
+        );
 
-        // Generate invalid version id
-        const MUNGED_VERSION_ID: u32 = 0x01010101;
-        let invalid_version_struct = TaggedVersionedStruct::<TestContainerRef> {
-            type_id: EXPECTED_TYPE_ID,
-            version_id: MUNGED_VERSION_ID,
-            inner: &v1_container,
+        let unsupported_version = RkyvVersionedError::UnsupportedVersionError {
+            type_name: TestContainerOwned::ARCHIVE_TYPE_NAME,
+            found_version: 3,
+            newest_known_version: TestContainerOwned::NEWEST_VERSION_ID,
         };
+        assert_eq!(
+            unsupported_version.to_string(),
+            "TestContainerOwned: unsupported version 3 (newest known: 1)"
+        );
 
-        let invalid_version_bytes =
-            rkyv::to_bytes::<rkyv::rancor::Error>(&invalid_version_struct).unwrap();
+        let upgrade_not_supported = RkyvVersionedError::UpgradeNotSupported {
+            type_name: TestContainerOwned::ARCHIVE_TYPE_NAME,
+            from_version: 0,
+        };
+        assert_eq!(
+            upgrade_not_supported.to_string(),
+            "TestContainerOwned: cannot upgrade data written as version 0"
+        );
+    }
 
-        match access_from_tagged_bytes::<TestContainerOwned>(&invalid_version_bytes) {
-            Err(RkyvVersionedError::UnsupportedVersionError(version)) => {
-                assert_eq!(version, MUNGED_VERSION_ID);
+    #[test]
+    fn test_upgrade_owned() {
+        let v1_bytes = to_tagged_bytes(&TestContainerOwned::V1(make_v1())).unwrap();
+
+        // An older version is converted, so the caller only ever sees the latest type
+        let upgraded = upgrade_from_tagged_bytes::<TestContainerOwned>(&v1_bytes).unwrap();
+        match &upgraded {
+            MaybeUpgraded::Upgraded(v2) => {
+                assert_eq!(v2.a, 1);
+                assert_eq!(v2.b, 2);
+                assert_eq!(v2.c, 0);
+                assert_eq!(v2.d, V1_STRING);
             }
-            _ => panic!("Expected RkyvVersionedError::UnsupportedVersionError"),
-        };
+            MaybeUpgraded::Current(_) => panic!("Expected V1 to be upgraded"),
+        }
+        assert_eq!(upgraded.into_owned().unwrap().d, V1_STRING);
+
+        // The latest version stays zero-copy
+        let v2_bytes = to_tagged_bytes(&TestContainerOwned::V2(make_v2())).unwrap();
+        let current = upgrade_from_tagged_bytes::<TestContainerOwned>(&v2_bytes).unwrap();
+        match &current {
+            MaybeUpgraded::Current(v2_ref) => assert_archived_v2(v2_ref),
+            MaybeUpgraded::Upgraded(_) => panic!("Expected V2 to be current"),
+        }
+        assert_eq!(current.into_owned().unwrap(), make_v2());
+    }
+
+    #[test]
+    fn test_upgrade_ref() {
+        let v1 = make_v1();
+        let v1_bytes = to_tagged_bytes(&TestContainerRef::V1(&v1)).unwrap();
+
+        match upgrade_from_tagged_bytes::<TestContainerRef>(&v1_bytes).unwrap() {
+            MaybeUpgraded::Upgraded(v2) => assert_eq!(v2.d, V1_STRING),
+            MaybeUpgraded::Current(_) => panic!("Expected V1 to be upgraded"),
+        }
+
+        let v2 = make_v2();
+        let v2_bytes = to_tagged_bytes(&TestContainerRef::V2(&v2)).unwrap();
+
+        match upgrade_from_tagged_bytes::<TestContainerRef>(&v2_bytes).unwrap() {
+            MaybeUpgraded::Current(v2_ref) => assert_archived_v2(v2_ref),
+            MaybeUpgraded::Upgraded(_) => panic!("Expected V2 to be current"),
+        }
+    }
+
+    #[test]
+    fn test_upgrade_single_version_container() {
+        let v1_bytes = to_tagged_bytes(&TestContainerSingle::V1(make_v1())).unwrap();
+
+        match upgrade_from_tagged_bytes::<TestContainerSingle>(&v1_bytes).unwrap() {
+            MaybeUpgraded::Current(v1_ref) => assert_archived_v1(v1_ref),
+            MaybeUpgraded::Upgraded(_) => panic!("The only version is always current"),
+        }
+    }
+
+    #[test]
+    fn test_upgrade_refused() {
+        let v1_bytes =
+            to_tagged_bytes(&TestContainerLegacyRefused::V1(LegacyStructV1 { a: 1 })).unwrap();
+
+        match upgrade_from_tagged_bytes::<TestContainerLegacyRefused>(&v1_bytes) {
+            Err(RkyvVersionedError::UpgradeNotSupported {
+                type_name,
+                from_version,
+            }) => {
+                assert_eq!(type_name, "TestContainerLegacyRefused");
+                assert_eq!(from_version, 0);
+            }
+            _ => panic!("Expected RkyvVersionedError::UpgradeNotSupported"),
+        }
+
+        // The latest version of the same container still reads fine
+        let v2_bytes =
+            to_tagged_bytes(&TestContainerLegacyRefused::V2(LegacyStructV2 { a: 1 })).unwrap();
+
+        match upgrade_from_tagged_bytes::<TestContainerLegacyRefused>(&v2_bytes).unwrap() {
+            MaybeUpgraded::Current(v2_ref) => assert_eq!(v2_ref.a, 1),
+            MaybeUpgraded::Upgraded(_) => panic!("Expected V2 to be current"),
+        }
     }
 }
