@@ -89,7 +89,9 @@ fn generate(
         // Only unnamed fields are supported
         if let Fields::Unnamed(fields) = &variant.fields {
             if fields.unnamed.len() != 1 {
-                let error_string = format!("Only one unnamed field per enum variant is supported, found multiple fields in {current_field_debug_name}");
+                let error_string = format!(
+                    "Only one unnamed field per enum variant is supported, found multiple fields in {current_field_debug_name}"
+                );
                 error_messages.extend(quote! {
                     compile_error!(#error_string);
                 });

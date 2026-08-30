@@ -623,7 +623,9 @@ where
 pub unsafe fn access_from_tagged_bytes_unchecked<'a, T: VersionedContainer + 'a>(
     buf: &'a [u8],
 ) -> &'a T::Archived {
-    let archived = rkyv::access_unchecked::<ArchivedTaggedVersionedStruct<T>>(buf);
+    // SAFETY: the caller guarantees `buf` holds exactly one tagged `T`, aligned, as documented
+    // above. Everything this reads is then in bounds and correctly typed.
+    let archived = unsafe { rkyv::access_unchecked::<ArchivedTaggedVersionedStruct<T>>(buf) };
     &archived.inner
 }
 

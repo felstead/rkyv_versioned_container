@@ -1,124 +1,168 @@
 # rkyv_versioned
 
-`rkyv_versioned` is a Rust library that provides an ergonomic versioned container for [rkyv](https://github.com/rkyv/rkyv) archives. This allows for both backwards and forwards compatibility for when the structures of the archives change over time.
+[![crates.io](https://img.shields.io/crates/v/rkyv_versioned.svg)](https://crates.io/crates/rkyv_versioned)
+[![docs.rs](https://docs.rs/rkyv_versioned/badge.svg)](https://docs.rs/rkyv_versioned)
 
-## Features
-
-- **Versioned Containers**: Easily manage different versions of your data `rkyv` structures.
-- **Backwards and Forwards Compatibility**: Access older versions of your serialized `rkyv` data without issues, and be able to identify newer versions.
-
-## Installation
-
-Add the following to your `Cargo.toml`:
+`rkyv_versioned` provides versioned containers for [rkyv](https://github.com/rkyv/rkyv) archives, so
+data written by an older or newer build of your code can still be identified and read. Serialized
+data gets a small header holding a type ID and a version ID, which a reader checks before touching
+the data itself.
 
 ```toml
 [dependencies]
-rkyv_versioned = "0.1.0"
+rkyv_versioned = "0.2"
 ```
 
-## Usage
+## How it works
 
-To provide backwards and forwards compatibility between structures formatted by `rkyv`, we follow these steps:
-- We should provide implementations of all "known" versions of an `rkyv` structure in our code (see `TestStructV1` and `TestStructV2` in the example below)
-- We wrap these versions in an enum describing all of the different versions, and use the `#[derive(VersionedArchiveContainer)]` macro on that enum in addition to your usual `#[derive(Archive, Serialize, Deserialize)]` definitions for an `rkyv` type, see `TestVersionedContainer` in the example below.
-
-However, there are some important rules to abide by:
-- **The layout/structure of the `rkyv` implementations MUST NOT CHANGE between versions of the code** - if you make changes, it is important to declare a new type and add it to our versioned container. This is because we will try to deserialize/access the data using the implementation in the current code, so if we serialize `TestStructV1` with one layout and then change it later, it may not be able to be read correctly.  Instead, try declaring `TestStructV2` and add it to our versioned container.
-- **The versioned container's enum order MUST NOT CHANGE** - the IDs of each variant are based on their order, so it is important to keep this consistent and **only add new variants to the end of the struct**.
-
-An example:
+Declare every version of a structure as its own type, then wrap them in an enum that derives
+`VersionedArchiveContainer` alongside rkyv's usual derives:
 
 ```rust
 use rkyv::{Archive, Serialize, Deserialize};
-use rkyv_versioned_container::*;
+use rkyv_versioned::*;
 
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-struct TestStructV1 {
-    pub a: u32,
-    pub b: u32,
-    pub c: String,
+#[derive(Debug, Archive, Serialize, Deserialize)]
+struct EntryV1 {
+    pub revision: u32,
+    pub name: String,
 }
 
-#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
-struct TestStructV2 {
-    pub a: u64,
-    pub b: u64,
-    pub c: u64,
-    pub d: String,
+#[derive(Debug, Archive, Serialize, Deserialize)]
+struct EntryV2 {
+    pub revision: u64,
+    pub name: String,
+    pub retired: bool,
 }
 
-#[derive(Debug, Clone, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
-enum TestVersionedContainer<'a> {
-    V1(#[rkyv(with=InlineAsBox)] &'a TestStructV1),
-    V2(#[rkyv(with=InlineAsBox)] &'a TestStructV2),
-}
-
-fn main() {
-    // Serialize a v1 into a versioned container byte stream
-    let v1 = TestStructV1 {
-        a: 1,
-        b: 2,
-        c: "YEET".to_owned(),
-    };
-
-    // Create our versioned container to store our v1 data
-    let container = TestVersionedContainer::V1(&v1);
-
-    // This byte stream contains extra metadata allowing you to identify the type and version before
-    // attempting to access it
-    let tswv_container_bytes: AlignedVec = to_tagged_bytes(&container).unwrap();
-
-    // Imagine now that you're reading this byte stream from a file or network - it is _probably_ a
-    // TestContainer::V1, but you can't be sure, it _could_ be a TestContainer::V2 (which would
-    // be fine) or, if we're older version of the code against newer data, a TestContainer::V3.  Or
-    // maybe it's not even a TestContainer at all. With the tagged container, we can validate
-    // beforehand, or have logic to handle different structures or versions.
-    let (type_id, version_id) =
-        get_type_and_version_from_tagged_bytes(&tswv_container_bytes).unwrap();
-    assert_eq!(type_id, TestVersionedContainer::ARCHIVE_TYPE_ID);
-    assert_eq!(version_id, container.get_entry_version_id());
-
-    // You can now more confidently access the data using zero-copy rkyv primitives.  Alternatively,
-    // you can implicitly use the `RkyvVersionedError` type to handle errors programmatically.
-    match access_from_tagged_bytes::<TestVersionedContainer>(&tswv_container_bytes) {
-       Ok(ArchivedTestVersionedContainer::V1(v1_ref)) => {
-           assert_eq!(v1_ref.a, 1);
-           assert_eq!(v1_ref.b, 2);
-           assert_eq!(v1_ref.c, "YEET");
-       },
-       Ok(_) => panic!("Expected V1"),
-       Err(RkyvVersionedError::BufferTooSmallError) => panic!("Buffer too small!"),
-       Err(RkyvVersionedError::UnexpectedTypeError(expected, found)) => panic!("Expected type {} but got {}", expected, found),
-       Err(RkyvVersionedError::UnsupportedVersionError(version)) => panic!("Found unsupported version {}", version),
-       Err(RkyvVersionedError::RkyvError(rkyv_error)) => panic!("Rkyv error: {}", rkyv_error)
-   };
+#[derive(Debug, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
+enum EntryContainer {
+    V1(EntryV1),
+    V2(EntryV2),
 }
 ```
 
-## Implementation
-The `#[derive(VersionedArchiveContainer)]` will implement the `VersionedContainer` trait on the enum:
+`to_tagged_bytes` serializes a container, and `access_from_tagged_bytes` validates the header before
+handing back the archived data:
 
 ```rust
-pub trait VersionedContainer: Archive {
-    const ARCHIVE_TYPE_ID: u32;
-    fn is_valid_version_id(version: u32) -> bool;
-    fn get_entry_version_id(&self) -> u32;
+let bytes = to_tagged_bytes(&EntryContainer::V2(EntryV2 {
+    revision: 7,
+    name: "main".to_owned(),
+    retired: false,
+}))?;
 
-    fn get_type_and_version_from_tagged_bytes(
-        buf: &[u8],
-    ) -> Result<(u32, u32), rkyv::rancor::Error>;
-    fn access_from_tagged_bytes(buf: &[u8]) -> Result<&Self::Archived, rkyv::rancor::Error>;
-    fn to_tagged_bytes(item: &Self) -> Result<AlignedVec, rkyv::rancor::Error>
-    where
-        Self: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rkyv::rancor::Error>>;
+// The header can be read without touching the data, to decide whether this is yours to read
+let (type_id, version_id) = get_type_and_version_from_tagged_bytes(&bytes)?;
+assert_eq!(type_id, EntryContainer::ARCHIVE_TYPE_ID);
+
+let entry = access_from_tagged_bytes::<EntryContainer>(&bytes)?;
+```
+
+Reading data written by a *newer* build fails with a clear error rather than misreading it:
+
+```text
+EntryContainer: unsupported version 3 (newest known: 1)
+```
+
+## Two rules
+
+- **The layout of each version's type must never change.** Data already written was serialized
+  against the layout in the code at the time, so changing a type in place makes existing data
+  unreadable. Declare a new type and add it to the container instead.
+- **The container's variant order must never change.** Version IDs come from variant position, so
+  add new variants only at the end.
+
+## Reading across versions
+
+Destructuring the container at each read site, `let EntryContainer::V1(v1) = &container`, ties every
+one of those sites to a version, so adding a `V3` means editing all of them. Put the version
+knowledge in accessors on the archived container instead:
+
+```rust
+impl ArchivedEntryContainer {
+    pub fn revision(&self) -> u64 {
+        match self {
+            // Note we need to upcast the revision from u32 to u64 for V1 for consistency
+            ArchivedEntryContainer::V1(v1) => v1.revision.to_native() as u64,
+            // Latest is already u64, so no conversion needed
+            ArchivedEntryContainer::V2(v2) => v2.revision.to_native(),
+        }
+    }
+
+    // Added in V2, so older data answers with a documented default
+    pub fn retired(&self) -> bool {
+        match self {
+            // Older versions did not have the `retired` field, so we return the default
+            ArchivedEntryContainer::V1(_) => false,
+            // Otherwise return the canonical value from the current version
+            ArchivedEntryContainer::V2(v2) => v2.retired,
+        }
+    }
 }
 ```
 
-This generated code will include a (mostly) unique `u32` ID for the type in `ARCHIVE_TYPE_ID` (based on the crc32 of the container type name, e.g. `crc32(TestVersionedContainer)`) and it will generate incrementing IDs for each variant of its containing struct, e.g. `V1` has a version ID of `0`, `V2` has a version ID of `1` and so on.
+Reading code calls `entry.revision()` and works against either version, with no conversion and no
+allocation, since accessors read straight out of the mapped bytes. Adding a `V3` makes each
+accessor's match non-exhaustive, so the compiler points at the accessors to extend and leaves call
+sites alone.
 
-When the data is serialized using `to_tagged_bytes` it is serialized as a `TaggedVersionedStruct`, which looks like this:
+## Upgrading to the latest version
+
+Code that needs an *owned* value of the newest type, such as a pass that rewrites stored records,
+implements `VersionedUpgrade` on the archived container:
+
 ```rust
-#[derive(Debug, Clone, Archive, Serialize)]
+impl VersionedUpgrade for ArchivedEntryContainer {
+    type Latest = EntryV2;
+
+    fn upgrade(&self) -> Result<MaybeUpgraded<'_, EntryV2>, RkyvVersionedError> {
+        match self {
+            ArchivedEntryContainer::V1(v1) => Ok(MaybeUpgraded::Upgraded(EntryV2 {
+                revision: v1.revision.to_native() as u64,
+                name: v1.name.to_string(),
+                retired: false,
+            })),
+            ArchivedEntryContainer::V2(v2) => Ok(MaybeUpgraded::Current(v2)),
+        }
+    }
+}
+```
+
+`MaybeUpgraded` works like `std::borrow::Cow`: data already at the latest version stays zero-copy in
+the `Current` arm, and only older data pays for a conversion. `into_owned()` produces an owned value
+from either arm. An arm that deliberately refuses to convert older data returns
+`RkyvVersionedError::UpgradeNotSupported`.
+
+## Container attributes
+
+```rust
+#[derive(Debug, Archive, Serialize, Deserialize, VersionedArchiveContainer)]
+#[rkyv_versioned(archive_type_name = "myapp::LedgerEntry")]
+enum LedgerEntryContainer {
+    V1(EntryV1),
+}
+```
+
+`archive_type_name` pins the string that the type ID is hashed from, instead of the container's
+identifier. Use it when two containers readable from the same store would otherwise share an
+identifier, or to keep the ID stable across a future rename. Setting or changing it changes the
+stored type ID, so pick it before writing data.
+
+## Buffer contract
+
+A tagged byte array must be handed back to the accessors exactly as it came out of
+`to_tagged_bytes`. rkyv locates the archived root from the *end* of the buffer, so a buffer with
+trailing bytes reads the header from the wrong offset. If records are stored in fixed-size pages,
+keep the serialized length alongside each record and slice to it before reading, because the length
+cannot be recovered from the tagged bytes. Alignment follows rkyv's usual rules for the archived
+type.
+
+## Serialized form
+
+`to_tagged_bytes` serializes a `TaggedVersionedStruct`:
+
+```rust
 pub struct TaggedVersionedStruct<'a, T: Archive> {
     pub type_id: u32,
     pub version_id: u32,
@@ -126,21 +170,31 @@ pub struct TaggedVersionedStruct<'a, T: Archive> {
     pub inner: &'a T,
 }
 ```
-If we access this with `T` set as the unit type (i.e. `()`) this will allow us to deserialize the `type_id` and `version_id` fields without trying to actually deserialize the `inner` field, which is serialized as a `Box<()>` which is effectively ignored.
 
+`type_id` is a CRC32 of the container's name, and `version_id` is the position of the variant, so
+`V1` is `0`, `V2` is `1`, and so on. Accessing this with `T` as the unit type reads the two header
+fields without deserializing `inner`, which is how the header peek works. The wrapper costs 12 bytes
+per record.
 
 ## Documentation
 
-For detailed documentation, please visit [docs.rs](https://docs.rs/rkyv_versioned).
+Full documentation, including the error type and the unchecked accessor's safety contract, is on
+[docs.rs](https://docs.rs/rkyv_versioned).
 
-## Contributing
+## Development
 
-We welcome contributions! Please see our [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets
+cargo fmt
+dprint fmt
+```
+
+`dprint fmt` formats the Markdown files, wrapping prose at 100 columns so hand-edited documents stay
+consistent. Install it with `cargo install dprint`, and use `dprint check` to verify without
+writing. The plugin version is pinned in [dprint.json](dprint.json), so formatting does not change
+underfoot.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
-## Acknowledgements
-
-Special thanks to the contributors of the [rkyv](https://github.com/rkyv/rkyv) project for their foundational work.
+MIT. See [LICENSE](LICENSE).

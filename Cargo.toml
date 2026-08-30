@@ -1,6 +1,13 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "rkyv_versioned",
     "rkyv_versioned_derive",
 ]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/felstead/rkyv_versioned_container"
